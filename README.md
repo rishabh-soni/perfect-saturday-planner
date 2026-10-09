@@ -230,10 +230,3 @@ Timeouts, throttling, incomplete metadata and rainy-weather decision paths were 
 Codex helped inspect and extend the existing backend/UI, implement provider adapters, and create/run failure-case tests.
 Official provider documentation informed function calling, public-service limits and attribution.
 OpenAI performs live planning; the offline demo deliberately uses no LLM.
-
-## Submission checklist
-
-- GitHub repository: [rishabh-soni/perfect-saturday-planner](https://github.com/rishabh-soni/perfect-saturday-planner).
-- Local setup/run instructions, architecture, configuration, tests and AI-tool disclosure: this README.
-- Hosted public URL: **pending**; the project has not been deployed.
-- Optional demo video: not included.
