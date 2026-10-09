@@ -1,201 +1,239 @@
-# Saturday, Sorted — Perfect Saturday Planner
+# Perfect Saturday Planner — Saturday, Sorted
 
-A warm, responsive **Streamlit web app** powered by a Python 3.11+ Saturday planning agent using the **OpenAI** through the official `openai` Python SDK and native function calling. Phase 2 integrates the existing backend; hosting is deferred as requested.
+A Streamlit web app that turns a city, budget, time window, mood, interests and constraints into a practical Saturday itinerary. OpenAI selects Python tools through genuine multi-turn function calling. OpenStreetMap supplies venues, Open-Meteo supplies weather, and Google Routes supplies walking/driving estimates.
 
-## Run locally
+**Status:** local development and verification complete; no public deployment yet. The local URL is not the hosted submission URL. Deployment is deferred as requested.
 
-```sh
+## Local setup
+
+Prerequisites: Python **3.11+**, Git, and internet access for installation and live planning. The offline Bengaluru demo requires no API keys or planning API calls; viewing the interactive map still loads browser tiles and Leaflet assets.
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/rishabh-soni/perfect-saturday-planner.git
+cd perfect-saturday-planner
 python -m venv .venv
-# macOS/Linux:
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+# Edit .env as described below, or use the demo without keys.
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+These commands use the virtual environment directly, so PowerShell activation is unnecessary. When updating an existing checkout, keep your existing `.env` instead of overwriting it.
+
+### macOS / Linux
+
+```sh
+git clone https://github.com/rishabh-soni/perfect-saturday-planner.git
+cd perfect-saturday-planner
+python3 -m venv .venv
 source .venv/bin/activate
-# Windows PowerShell, instead:
-.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+cp .env.example .env
+# Edit .env as described below, or use the demo without keys.
+python -m streamlit run app.py
 ```
 
-No activation is necessary if you use `.venv\Scripts\python.exe` directly on Windows. Copy `.env.example` to `.env` and fill in keys **only for live mode**. `.env` is ignored by Git.
+Open the URL printed by Streamlit, normally **http://localhost:8501**. Select **Try the Bengaluru demo** for the fixture-based experience. Without an OpenAI key, the UI automatically selects the demo. For live planning, configure the key and turn the demo toggle off.
 
-Start the web application:
+## Configuration
 
-```sh
-streamlit run app.py
-# Windows without activating the environment:
-.venv\Scripts\python.exe -m streamlit run app.py
+Put credentials in the ignored `.env` file. Hosted Streamlit secrets are also supported, but hosting is not performed by this change. Never commit actual keys.
+
+```dotenv
+OPENAI_API_KEY=your_openai_key
+OPENAI_MODEL=gpt-4.1-mini
+GOOGLE_MAPS_API_KEY=your_google_routes_key
 ```
 
-Open the local URL printed by Streamlit. Choose **Try the Bengaluru demo** for an offline experience even when keys are configured. Without an OpenAI key, the UI automatically uses labeled demo data. To force a demo-only server for testing, set `SATURDAY_DEMO_ONLY=1` before starting Streamlit; unset it for the regular app. The checked-in appearance config never contains secrets.
+OpenAI is the active LLM provider. The Google key needs **Routes API** enabled, billing and appropriate API restrictions; **Google Places is not required**. OpenAI and Google Routes can incur charges. Missing/unavailable Google routing can use the explicitly labeled short-distance fallback described below.
 
-The default form uses Bangalore, INR 2,000, four hours, **3 PM**, a tired-but-fun mood, food/music/walks and vegetarian/avoid-crowds preferences. The **The assignment example** preset switches to the original sample's 10 AM default. The CLI still accepts exactly the original JSON example.
-
-```sh
-# Offline demonstration: no keys, no network, no LLM calls
-python main.py --mock
-python main.py --mock --input examples/input.json
-
-# Real LLM selecting tools, with explicitly mocked Google data
-python main.py --mock-places --input examples/input.json
-
-# Real LLM, Google Places and Google Routes
-python main.py --input examples/input.json
-
-# Read arbitrary JSON from stdin
-python main.py --mock --json - < examples/input.json
-
-python -m pytest -q
-```
-
-For PowerShell stdin, use `Get-Content -Raw examples/input.json | python main.py --mock --json -`.
-
-Environment variables:
-
-| Variable | Use |
+| Variable | Purpose / default |
 | --- | --- |
-| `OPENAI_API_KEY` | Required for the actual LLM agent; absent keys produce a descriptive failure. |
-| `OPENAI_MODEL` | Defaults to `gpt-4.1-mini`; override with an available OpenAI model supporting function calling. |
-| `GOOGLE_MAPS_API_KEY` | Optional; enable Places API (New) and Routes API, billing, and appropriate key restrictions. Missing/failed Places API uses labeled Bengaluru mock fixtures when available. |
-| `OPENAI_DIAGNOSTICS` | Optional: `1` enables redacted model details and local JSONL logs; default `0`. |
-| `AGENT_MAX_ITERATIONS` | Model turn budget, default `12`, bounded to `3`�`20`. |
-| `SATURDAY_DEMO_ONLY` | Optional UI setting: `1` forces an offline demo for local verification; default is personalized planning when an OpenAI key is available. |
+| `OPENAI_API_KEY` | Required for live LLM planning; absent keys select the UI demo. |
+| `OPENAI_MODEL` | `gpt-4.1-mini`; choose an available OpenAI model supporting function calling. |
+| `GOOGLE_MAPS_API_KEY` | Optional Google Routes credential. |
+| `OPENAI_DIAGNOSTICS` | `0`; `1` enables redacted diagnostics in traces and ignored local logs. |
+| `AGENT_MAX_ITERATIONS` | `12`, bounded to 3–20 model turns. |
+| `SATURDAY_DEMO_ONLY` | `1` forces the UI demo; unset for normal operation. |
+| `OSM_USER_AGENT` | Descriptive application identifier/contact; see `.env.example`. |
+| `NOMINATIM_URL` | `https://nominatim.openstreetmap.org/search` |
+| `OVERPASS_URL` | `https://overpass-api.de/api/interpreter` |
+| `OSM_SEARCH_RADIUS_METERS` | `2500`, bounded to 500–5000 m around the submitted location. |
+| `OPEN_METEO_URL` | `https://api.open-meteo.com/v1/forecast` |
+| `PROVIDER_CACHE_PATH` | `artifacts/provider-cache.sqlite3`; share across all workers on one host. |
+| `ROUTING_FALLBACK` | `1`; set `0` to require provider routing. |
+| `APP_PUBLIC_URL` | `http://127.0.0.1:8501/`; set the actual origin before hosting. |
+| `MAP_TILE_URL` | `https://tile.openstreetmap.org/{z}/{x}/{y}.png` |
+| `MAP_TILE_ATTRIBUTION` | Visible tile-provider/OSM attribution; see `.env.example`. |
 
-Google APIs can incur charges. Places Text Search requests rating, regular hours, price level and vegetarian evidence through an explicit field mask. Routes requests duration and distance only. No keys are hardcoded, logged, or included in traces. HTTP error bodies are omitted.
+OSM and Open-Meteo integrations need no API keys. If you change a public endpoint or tile provider, follow that provider's terms and update attribution.
+
+## Using the app
+
+The easier testing defaults are Bangalore, INR 2,000, four hours from **11:00**, a relaxed mood, food and walks, walking travel, vegetarian and avoid-crowds preferences. **The assignment example** preset restores the original tired mood, food/music/walks and 10:00 start.
+
+The optional starting neighborhood is resolved to a reference point, not a precise home address. If omitted, the available window begins at the first venue; home and return travel are excluded. Submit the form to apply changes. **Plan again** reuses the last submitted preferences and mode.
+
+Up to three distinct checked choices are offered. Shorter alternatives explain omitted interests and retained constraints. Selecting a choice updates the itinerary, warnings, budget and JSON download. If evidence supports fewer choices, the UI says so instead of inventing options. Unknown costs remain unknown; the budget table shows itemized ranges, bases and the known subtotal separately.
+
+The map shows venue markers and dotted **schematic stop order**, not navigable route geometry. Route times, distances and sources appear separately. The weather panel shows retrieved city-local hourly values. **How your Saturday was planned** displays actual backend actions and sanitized diagnostics.
 
 ## Input and output
 
-The assignment sample is in `examples/input.json`, and is the default CLI input. Optional fields:
+The original assignment input is supported and included in `examples/input.json`:
 
 ```json
 {
-  "starting_neighborhood": "central Bengaluru",
-  "start_time": "10:00",
-  "travel_mode": "walking",
-  "saturday": "2026-10-10"
+  "city": "Bangalore",
+  "budget": 2000,
+  "available_time": "4 hours",
+  "mood": "tired but wants to do something fun",
+  "interests": ["food", "music", "walks"],
+  "constraints": ["vegetarian", "avoid crowded places"]
 }
 ```
 
-Duration supports `4 hours`, `90 minutes`, `1.5h`, and `2h 30m`. Saturday defaults to the upcoming Saturday using India time; an explicit date must be a Saturday. All schedules use city-local 24-hour time and must finish that day. All budgets/costs in this phase use INR; currency conversion is not supported.
+Optional fields: `starting_neighborhood`, `start_time` (`HH:MM`), `travel_mode` (`walking` or `driving`) and `saturday` (`YYYY-MM-DD`, a Saturday). Dates default to the next Saturday in India time; schedules and weather use city-local times. The window must finish the same day. Duration accepts `4 hours`, `90 minutes`, `1.5h` or `2h 30m`. **All money is INR**, including for other cities; currency conversion is not implemented.
 
-JSON output includes normalized preferences, itinerary stops with provider-backed venue details, start/end times, activity duration, pre-activity buffer, itemized estimated costs, recommendation rationale, ordered routes, warnings/trade-offs, independent validation, and execution trace. Status values:
+Output includes original normalized preferences, provider-backed venues, scheduled stops, costs, rationale, routes, weather, validation, alternatives, warnings, model iteration/revision counts and execution trace.
 
-- `success`: all supported hard feasibility checks pass, while explicitly estimated prices remain disclosed.
-- `conditional`: no known violation, but critical data such as hours, dietary evidence, unknown prices or mock routes require confirmation. `validation.passed` is **false**.
-- `infeasible`: scoped offline-demo outcome when the available fixtures cannot satisfy the request. Live model claims of infeasibility are challenged and, if unresolved, reported as search failures rather than proof of impossibility.
-- `failure`: invalid input, missing/unavailable model, refusal, malformed output, exhausted planning limits, or no validated plan found among the searched options. This does not prove the user's request impossible.
+- `success`: supported feasibility checks pass; estimates can still change.
+- `conditional`: no known violation, but missing or estimated evidence needs confirmation. `validation.passed` is false.
+- `infeasible`: scoped offline-demo outcome when available fixtures cannot fit.
+- `failure`: input/provider/model errors, exhausted planning limits or no checked plan found; it does not prove the entire request impossible.
 
-A draft attached to `failure`/`infeasible` is for transparency and must not be presented as an approved recommendation. Exit status is 0 for `success`/`conditional`, 1 otherwise. Without a starting neighborhood, the time window begins at the first venue; travel from home and the return journey are explicitly excluded. If an origin is supplied, it must be discovered and matched, and travel to the first stop must be accounted for.
-
-The example offline plan uses nearby Cubbon Park and Koshy's, a short walk/rest and meal, and optional headphones while seated for music. Its fixtures are illustrative: **not current verified venue, price, hours, menu, crowd or route data**. It returns a conditional result with confirmation warnings rather than a false full validation pass.
+Attached failed drafts remain explicitly unapproved. Unknown hours, dietary evidence and prices can yield conditional plans; explicit conflicts and known budget/time violations cannot be approved.
 
 ## Architecture
 
 ```text
-main.py                     CLI JSON boundary / dotenv loading
-app.py                      Streamlit entry point, form, progress, session state
-ui/controller.py            Input mapping, safe agent boundary, download redaction
-ui/components.py            Itinerary, route, budget and real trace presentation
-ui/styles.py                Lightweight warm theme and responsive CSS
-.streamlit/config.toml      Appearance and local server defaults (no secrets)
-agent/schemas.py             Pydantic input, tool and final-output contracts
-agent/prompts.py             Planning and evidence instructions
-agent/planner.py             Provider-neutral tool loop, tool dispatch, trace, offline demo
-tools/places.py              Venue discovery + explicit mock fallback
-tools/routing.py             Discovered endpoint resolution + route availability
-tools/budget.py              Decimal-based, deterministic INR cost calculation
-tools/validator.py           Independent feasibility/evidence validation
-providers/llm.py            Model/session protocols for provider-neutral model adapters
-providers/chat_completions.py Shared native Chat Completions tool protocol
-providers/openai.py         Active OpenAI endpoint, model and error mapping
-providers/groq.py           Retained optional Groq adapter, inactive by default
-providers/google.py         Google REST adapters with 12-second request timeout
-providers/mock.py           Six curated Bengaluru fixtures + labeled route estimates
-tests/                      Offline validation, agent protocol and provider tests
+Streamlit form / CLI JSON
+        ↓
+Pydantic preference normalization
+        ↓
+Nominatim city + optional neighborhood → shared cache / request gate
+        ↓
+Open-Meteo Saturday-window forecast → model context
+        ↓
+OpenAI native tool-calling loop
+  search_places → Overpass / OSM catalog
+  get_weather   → retrieved, cached forecast
+  get_route     → Google Routes / labeled short-distance fallback
+  estimate_cost → deterministic Decimal-based cost calculation
+  validate_plan → original constraints + authoritative venue/route evidence
+        ↓
+submit_plan → independent server validation / bounded correction
+        ↓
+Checked alternative comparison → Streamlit itinerary, weather, map and JSON
 ```
 
-The real agent dynamically selects `search_places`, `get_route`, `estimate_cost`, and `validate_plan` using OpenAI Chat Completions. `OpenAIModel` creates the official `OpenAI` client with an explicit `OPENAI_API_KEY` and `base_url="https://api.openai.com/v1"`. The default model is `gpt-4.1-mini`, overridable through `OPENAI_MODEL`. Old Groq/Gemini keys and endpoint environment variables do not change the active provider.
+| Module | Responsibility |
+| --- | --- |
+| `app.py`, `ui/controller.py` | Form mapping, progress callbacks, session state, option selection, safe export. |
+| `ui/components.py`, `ui/map.py`, `ui/styles.py` | Itinerary, costs, weather, Folium map and presentation. |
+| `agent/planner.py`, `agent/prompts.py`, `agent/schemas.py` | Bounded orchestration, tool registry, policy, typed input/output. |
+| `providers/openai.py`, `providers/chat_completions.py`, `providers/llm.py` | Modular provider boundary and native multi-turn function-call protocol. |
+| `providers/nominatim.py`, `providers/osm.py`, `providers/weather.py` | Geocoding, tag discovery/normalization and hourly forecast integration. |
+| `providers/cache.py`, `providers/public_http.py` | Shared SQLite TTL cache, throttling, cooldowns and bounded safe HTTP calls. |
+| `providers/google.py`, `providers/mock.py` | Google Routes and explicit Bengaluru fixtures. Legacy Places adapter is retained but inactive in the default planner. |
+| `tools/` | Tool contracts, routing, costs, mandatory validation and conservative OSM hours parsing. |
+| `main.py`, `tests/` | CLI entry point and offline/mock regression coverage. |
 
-OpenAI and the retained optional Groq adapter share `providers/chat_completions.py`, so they use the same multi-turn protocol and independent server checks. Only provider configuration and safe error mapping differ.
+OpenAI decides which tools to invoke. Each assistant tool-call message remains in conversation history, and every executed function receives a matching `role=tool` response with its exact call ID. Results are returned before the next inference. Parallel calls are supported; malformed arguments and missing/duplicate IDs are rejected. `submit_plan` is a separate native function for structured final output, not a single itinerary-generation prompt.
 
-Tool schemas come from the existing Pydantic models. Each assistant message containing `tool_calls` is retained in conversation history, then Python executes the requested tools and appends one `role="tool"` response with the exact `tool_call_id` and function name for every call. All results are sent back to the active provider before another inference step. Parallel calls are supported; missing or duplicate IDs and mismatched responses are rejected. Malformed JSON arguments receive matching error responses and a bounded correction attempt rather than executing invalid data.
+Final validation runs independently against **original** preferences and discovered evidence. The model cannot override city, budget, travel mode or hard constraints through tool arguments. At least three distinct tools must execute before a recommendation is accepted. Limits remain 12 model turns by default, two server validation revisions and 24 tool executions. Model requests time out after 30 seconds with automatic retries disabled.
 
-A fifth native function, `submit_plan`, supplies the complete `Decision` schema for final structured output. Pydantic checks the submission before independent server validation. Invalid schemas and rejected drafts receive matching tool responses requesting correction; submissions alongside planning tools are deferred until their results are reviewed. Text-only answers are not accepted as itineraries. SDK reasoning extras are excluded from logs and request history.
+`Planner.add_alternatives` is a traced business-rule comparison after the genuine LLM run. It reuses discovered venues and prices, recalculates costs and validates every offered variant against the original constraints, sharing the tool cap. It is not presented as an extra model call. The fixture-based offline builder makes no LLM calls. The optional Groq adapter remains modular and inactive by default.
 
-`Planner(llm=provider)` accepts the provider-neutral `ModelProvider`/`ModelSession` protocols, allowing future adapters without changing tools, validation or frontend. `Planner(client=client)` injects an OpenAI SDK client configured for OpenAI, useful for deterministic HTTP transport tests.
+## Provider behavior, caching and operating policies
 
-The server always validates the final proposal against **original preferences**, discovered venue IDs, and recorded route results, independently of model claims or model-initiated validation. The LLM cannot override the budget, city, mode or hard constraints through tool arguments. At least three distinct tools must execute before a recommendation is accepted. Stops reference discovered IDs; public venue names/addresses/hours are hydrated from the provider catalog.
+### OpenStreetMap / Overpass
 
-Limits: 12 model iterations by default (`AGENT_MAX_ITERATIONS`, clamped to 3�20; invalid values use 12), two independent validation revisions, 24 total tool executions, 30-second model timeout with automatic retries disabled. Google requests also have bounded timeouts. Plans with known violations cannot be accepted. The offline mode uses real deterministic tool executions and a simple fixture-based plan builder; it is **not evidence of LLM planning** and is explicitly labeled `offline_demo`.
+Named restaurants/cafés (`amenity=restaurant|cafe`), museums/galleries/attractions (`tourism=museum|gallery|attraction`), parks/gardens (`leisure=park|garden`) and bookshops (`shop=books`) are queried with `nwr` around one compact anchor. Ways and relations use returned centers. Results retain real names, coordinates, available address/cuisine/opening-hour tags and explicit dietary/accessibility evidence. Private/no-access tags are excluded. Missing prices, ratings and amenities are never manufactured. Indoor/outdoor suitability is a disclosed venue-type heuristic, not proof of shelter or access.
 
-## Frontend behavior
+Search results cache one hour; empty results cache five minutes. An empty search receives the existing single broader retry. Public-service errors back off and may use clearly labeled Bengaluru fixtures; other cities receive a scoped empty/error outcome. Area text does not trigger arbitrary LLM-generated geocoding or move the user-submitted anchor. No endpoint racing or automatic host rotation is used after throttling.
 
-The form maps interests, optional neighborhood, INR budget, duration, mood, constraints and travel mode into the existing `Preferences` schema. Café interests normalize to food and history to culture; avoid crowds normalizes to the sample constraint. Budget-friendly uses the numeric budget check. Low walking remains a hard requirement, with an explicit confirmation warning when the existing backend cannot substantiate it; it is never silently relaxed.
+Attribution: [© OpenStreetMap contributors / ODbL](https://www.openstreetmap.org/copyright). Review [Overpass public-service guidance](https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances).
 
-An optional `Planner(on_event=callback)` receives a sanitized copy of each **actual recorded event**. The UI updates a native Streamlit status container as those events occur. No fabricated tool actions, reasoning or artificial sleeps are used. The complete trace is retained under **How your Saturday was planned**, including after rerenders. A fresh planner is created for every request.
+### Nominatim — read before live use or hosting
 
-Results and last submitted preferences persist in `st.session_state`. **Plan again** reuses the last submitted preferences and planning mode; submit the form to apply edits. Input validation errors preserve any previous plan while clearly explaining that a new plan was not generated. Unexpected backend exceptions produce a helpful failure message and retain any actual events recorded before the interruption.
+**Comply with the [public Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/).** This app uses only moderate-volume, user-triggered city/neighborhood submissions, with a descriptive User-Agent and project contact URL. Configure a maintained operator contact before hosting. There is no client-side autocomplete, bulk geocoding or generic address-search service. Do not submit confidential personal addresses.
 
-The itinerary shows provider-backed venue data, activity rationale, timing, cost confidence and ordered travel segments. Maps uses Google place IDs when available; demo venues use name/address searches rather than pretending approximate coordinates are verified. Unknown costs stay unknown and are omitted from the native spending chart. Failure/infeasible drafts are shown only in a clearly marked unapproved-draft expander, never as an accepted itinerary. Downloaded JSON and all displayed fields are redacted; the complete trace is preserved.
+Geocodes cache 30 days; misses cache one hour. All sessions and processes on **one host** must share the same `PROVIDER_CACHE_PATH`. SQLite serializes each entire Nominatim request and cache fill, maintaining at least **1.05 seconds** between starts and persisting rate-limit cooldowns. Multiple hosts need one centralized compliant geocoding proxy/service; separate cache files cannot enforce an application-wide rate limit. Do not clear the cache on every rerun. The endpoint is configurable without code changes.
 
-## Validation and failure handling
+Unresolved or implausibly distant neighborhoods fail gracefully instead of inventing an origin. A geocoded reference point cannot become an activity venue.
 
-- Costs use upper range bounds for budget feasibility and Decimal arithmetic. Missing prices are `unknown`, never silently zero; totals and remaining budget are null if any price is unknown. Google price level never becomes a fabricated verified price. The current providers cannot substantiate verified activity prices, so those claims are rejected. Walking has a zero fare; driving needs an explicit allowance.
-- Scheduling checks all activity intervals, route time, buffers, overlaps and the full elapsed window. No usable recorded route means rejection; live route failure never becomes a fabricated travel estimate. Mock routes use straight-line distance ×1.4 and fixed illustrative speeds, always labeled low confidence.
-- Saturday regular opening periods are checked when present, including overnight and 24/7 periods. Unknown hours produce conditional output; regular hours do not guarantee holiday or future availability.
-- Vegetarian/vegan/pure-vegetarian food evidence, wheelchair and alcohol-free requirements are hard constraints. Vegetarian options do not establish an exclusively vegetarian venue or vegan menu. Unknown evidence requires confirmation; explicit false evidence rejects the plan. Other hard constraints are conservatively marked as requiring manual confirmation.
-- Crowds, quietness and low-energy preferences are soft. The server retries an empty search once with broader discovery in both agent and offline modes, records both actual searches in the trace, and retains all hard constraints for validation. The bounded loop prevents endless searches.
-- Traces contain sanitized arguments, duration, success/failure, concise result summaries and revision events. Estimated results count as tool execution success; conditional/invalid validation does not count as a validation pass. No chain-of-thought is exposed.
+### Open-Meteo
 
-## Model diagnostics
+One day forecast requests hourly precipitation probability, temperature and WMO weather codes with `timezone=auto`. Only hours overlapping the submitted window are used, including partial boundary hours. Responses cache 30 minutes. Missing values/hours and out-of-horizon dates remain partial/unavailable; they do not imply sunshine.
 
-Set `OPENAI_DIAGNOSTICS=1` to capture redacted upstream error messages and function-call arguments. Basic HTTP status, model, run ID, turn, timing, response/request IDs, finish reason and usage metadata are available in model trace events. Invalid submissions include exact schema error fields/types/messages, also returned to the active provider for correction. Raw reasoning, response bodies, `failed_generation`, prompts and headers are excluded.
+The model receives actual hourly evidence in context; `get_weather` reuses it without another HTTP request. Adverse precipitation (60%+), heavy weather codes or uncomfortable temperatures favor indoor discovery and alternatives. Validation warns when adverse weather overlaps outdoor stops. Unavailable forecasts retain an indoor-backup warning.
 
-In **How your Saturday was planned**, select **Show sanitized tool arguments and model diagnostics**. The downloaded result also includes these trace diagnostics. With detailed diagnostics enabled, the server appends JSON lines to `artifacts/llm-diagnostics.jsonl`, ignored by Git. Each entry has a UTC timestamp, run ID and turn so concurrent requests can be distinguished. These logs can contain user preferences or venue details inside function arguments; keep them local and disable detailed logging with `OPENAI_DIAGNOSTICS=0` when finished. Credentials are redacted; full prompts, HTTP headers and hidden reasoning/signatures are never logged. Diagnostic file failures do not interrupt planning.
+Attribution: [Open-Meteo.com](https://open-meteo.com/), CC BY 4.0. The [free API terms](https://open-meteo.com/en/terms) restrict use to non-commercial applications and fewer than 10,000 calls/day, 5,000/hour and 600/minute. Use a suitable service plan for commercial or larger deployments.
 
-## Tests and verification
+### Google Routes and approximate fallback
 
-Verified locally: **151 tests passed**, including existing backend and frontend/integration tests and actionable OpenAI/Groq model-error tests. The sample CLI output was parsed back into the public Pydantic result schema and checked for all four tool actions. It produced a **105-minute**, **INR 650 upper-bound** mock plan with `status=conditional` and no known validation errors. Missing hours and mock evidence correctly prevent `validation.passed=true`.
+Walking/driving calls use OSM coordinates as `location.latLng`, a 12-second timeout, and only `routes.duration,routes.distanceMeters`. Repeated legs reuse evidence within the current planning run; Google responses are not written to the persistent provider cache. Way/relation centers may snap to an unsuitable road/entrance and require confirmation.
 
-Streamlit AppTest verifies startup, form mapping, submission into the actual mock backend, rerender persistence, regeneration, invalid input, unknown-city failure, and rejected draft presentation. Other tests verify callback/trace equality, Maps URL provenance, unknown-cost categories, safe HTML escaping and secret-free downloads. A local Streamlit server returned **HTTP 200** on `/_stcore/health`; the browser demo was generated and inspected at mobile and desktop breakpoints. These tests make no external API calls. In restricted Windows sandboxes, Streamlit AppTest needs permission for local loopback sockets even though it does not contact external services.
+If Google is unavailable, short OSM/Nominatim journeys may use `source=distance_estimate`, `status=estimated`, `confidence=low`. Limits are 2 km straight-line for walking and 5 km for driving. Estimates use distance ×1.6, walking at 50 m/min +5 minutes, or driving at 166 m/min +10 minutes. These are planning allowances, **not navigable or Google-verified routes**. Mandatory validation counts their time and makes the result conditional. Longer or missing-coordinate legs remain unavailable. `ROUTING_FALLBACK=0` disables this fallback.
 
-Tests run with no external keys or network. They cover input normalization, hard/soft constraints, budget upper bounds, unknown costs, route/buffer accounting, venue evidence, missing/closed/overnight hours, Google authentication/rate limits/timeouts, routing failure, revisions, iteration limits, secret redaction and mock demo behavior. Tests use the **actual OpenAI Python SDK** with an HTTP mock transport against both OpenAI and Groq URLs to verify tool schemas, multi-turn history, parallel calls, every planning tool, matching call IDs, final submissions, correction feedback, malformed JSON and safe API errors. The new OpenAI key is configured only in the ignored local `.env`; Groq credentials were removed from active local configuration. The latest live run used `gpt-4.1-mini`, real Places/Routes data, Bengaluru, INR 2,000, four hours starting at 15:00, driving, vegetarian and avoid-crowds preferences. A larger LLM draft failed validation; bounded recovery produced a one-stop provisional plan from 15:10�16:10 at a discovered venue, with a INR 600 upper estimate, zero validation errors and five confirmation warnings. It completed on turn 11 with one revision. Separate music/walk stops were explicitly omitted. This is a conditional plan, not a guarantee of prices, dietary availability or crowd conditions.
+[Google Routes policies](https://developers.google.com/maps/documentation/routes/policies) require Google-derived map results to appear on a Google Map. Therefore Google durations/distances are shown in separate attributed route cards; the OSM map contains only OSM venue coordinates and schematic stop order. No Google geometry or tiles are drawn on it.
 
-Official integration references: [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling), [GPT-4.1 mini](https://developers.openai.com/api/docs/models/gpt-4.1-mini), [Groq local tool calling](https://console.groq.com/docs/tool-use/local-tool-calling), [Groq OpenAI compatibility](https://console.groq.com/docs/openai), [Groq structured outputs](https://console.groq.com/docs/structured-outputs), [OpenAI Python SDK](https://developers.openai.com/api/reference/python), [Google Text Search (New)](https://developers.google.com/maps/documentation/places/web-service/text-search), [Google Routes](https://developers.google.com/maps/documentation/routes/compute-route-over).
+### Map and validation limits
 
-## Limitations and product trade-offs
+Folium/Leaflet uses configurable HTTPS OSM-compatible tiles with visible attribution. Set `APP_PUBLIC_URL` to the actual origin before hosting. The iframe uses an explicit page base and non-restrictive referrer policy. The browser fetches tiles directly and uses normal HTTP caching. No bulk download, tile proxy, offline archive or background prefetch is implemented; the tile layer has no extra buffer and updates when idle. Follow the [OSM tile policy](https://operations.osmfoundation.org/policies/tiles/) and use an appropriate provider if traffic grows.
 
-Mock coverage is Bengaluru only. The offline builder is intentionally small, covers nearby 2–3-stop suggestions, and can shorten a plan to reduce time/cost; it is less flexible than the real agent. There is no live events feed, crowd data, verified menu/admission pricing, route safety check, reservations, currency conversion, conversational clarification flow or deployment in this phase. Google data does not resolve arbitrary dietary/allergy/accessibility requirements; uncertainty is disclosed. OpenAI quota/rate limits (429), key permissions (401/403), unavailable models (404), rejected requests (400), server errors and connectivity failures return safe actionable messages with the actual trace retained. Raw upstream bodies and keys are omitted; exhausted quota does not trigger repeated paid requests. The demo remains available.
+Costs use conservative upper bounds and Decimal arithmetic. Unknown items keep the complete total and remaining budget unknown. Venue prices cannot be called verified without evidence; driving requires a nonzero allowance. Chronology includes pre-activity buffers and every required route. OSM weekly hours support day lists/ranges, time ranges, overnight hours, `off` and `24/7`; complex holiday/seasonal/solar expressions remain unknown. Community tags and regular hours do not establish future availability.
 
-Configure `OPENAI_API_KEY` in the ignored local `.env` or hosting secrets. `GOOGLE_MAPS_API_KEY` remains separately configured for Places and Routes. Without an OpenAI key, the UI explicitly uses the labeled offline demo; a direct live CLI request returns a missing-key failure. No secret is included in tracked configuration. The optional Groq adapter can still be injected with `Planner(llm=GroqModel(...))`; it is not selected automatically.
+Explicit dietary/accessibility conflicts are hard failures. Missing evidence is disclosed as conditional; unsupported requirements need manual confirmation. Interests, crowds and atmosphere are best effort. A shorter checked plan can omit optional interests, but cannot relax hard budget/time/dietary conflicts. Confirm current hours, menu, access, prices, weather and safe navigation before following conditional plans.
 
-`Planner` holds per-run evidence/trace state: the UI creates a new instance per request. It performs synchronous I/O and is not shared across simultaneous requests. Session state persists across Streamlit reruns within a browser session; a full page refresh/new session may clear it.
+## CLI and tests
 
-## Deployment preparation (not deployed)
+```sh
+# Offline demo: no keys or network calls
+python main.py --mock
+python main.py --mock --input examples/input.json
 
-Use `app.py` as the Streamlit entry point and install `requirements.txt` on Python 3.11+. Configure `OPENAI_API_KEY`, `GOOGLE_MAPS_API_KEY` and `OPENAI_MODEL` as **server-side hosting secrets** or environment variables. The app also reads Streamlit secrets (locally `.streamlit/secrets.toml`, which is ignored). Never upload `.env` or a real secrets file to GitHub. Keep `SATURDAY_DEMO_ONLY` unset for live planning. Verify Places API (New) and Routes API access with the backend Google key; an Android-restricted key is unsuitable for these server requests. No hosting resources, deploys or public URLs were created in Phase 2.
+# Real OpenAI with labeled fixture venues/routes
+python main.py --mock-places --input examples/input.json
 
-Streamlit references used for implementation: [status containers](https://docs.streamlit.io/develop/api-reference/status/st.status), [forms](https://docs.streamlit.io/develop/api-reference/execution-flow/st.form), [session state](https://docs.streamlit.io/develop/api-reference/caching-and-state/st.session_state), and [AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest).
+# Full live integrations
+python main.py --input examples/input.json
+
+# Regression tests: external HTTP responses are mocked
+python -m pytest -q
+```
+
+Without activation on Windows, substitute `.\.venv\Scripts\python.exe` for `python`. The CLI also supports `--json '<JSON>'` or `--json -` for stdin. In PowerShell: `Get-Content -Raw examples/input.json | .\.venv\Scripts\python.exe main.py --mock --json -`. Exit code is 0 for approved/conditional results, 1 for failures/infeasibility.
+
+In a restricted Windows environment, Streamlit AppTest may need local loopback access. If the default pytest temporary directory is inaccessible, choose a fresh project-local folder with `--basetemp=artifacts/pytest-local`; pytest owns and clears that chosen test directory.
+
+**Latest verification: 199 tests passed.** Tests mock all external HTTP, including native multi-turn calls through the actual OpenAI SDK. They cover the assignment's Bengaluru example and Jaipur, normalization, node/way/relation centers, incomplete metadata, private access, rate limits/timeouts, concurrent geocoding/cache gates, weather selection, opening hours, original constraints, route fallbacks, tool IDs/history, alternatives, Streamlit rerenders, escaped marker text, attribution and credential redaction.
+
+Separate live checks on **2026-10-09**:
+
+| Integration | Actually tested live |
+| --- | --- |
+| Nominatim | Bengaluru, Jaipur and the Indiranagar starting neighborhood. |
+| Overpass | Named places in Bengaluru and Jaipur. |
+| Open-Meteo | Hourly forecasts for the requested Saturday in both cities. |
+| Google Routes | Two walking routes and one driving route between retrieved OSM coordinates. |
+| OpenAI | Full Bengaluru native tool-calling run: nine turns, conditional itinerary, three choices, zero known validation errors. |
+| Folium/Leaflet | Browser rendering, OSM tiles, marker popups and visible attribution with the saved live result. |
+
+Timeouts, throttling, incomplete metadata and rainy-weather decision paths were tested with mocked responses, not induced against live providers. Jaipur's provider data was checked live; its end-to-end LLM protocol was tested with mocks. Live smoke calls are separate from pytest and never run automatically. Incomplete prices/hours/access still require confirmation. Local evidence and caches under `artifacts/` are ignored by Git.
 
 ## AI tooling disclosure
 
-Codex was used to implement the backend, create failure-case tests, and run the offline verification.
-Official OpenAI and Groq documentation informed the provider adapters and native function-call protocol.
-The real agent uses OpenAI for tool selection and personalized planning; the offline demonstration deliberately uses no LLM.
+Codex helped inspect and extend the existing backend/UI, implement provider adapters, and create/run failure-case tests.
+Official provider documentation informed function calling, public-service limits and attribution.
+OpenAI performs live planning; the offline demo deliberately uses no LLM.
 
-The agent now reserves time for final submission, batches independent calls, prefers compact venue clusters and reuses existing evidence. With three model turns remaining it receives a traced reminder to finish or return infeasible. The 24-tool execution cap and two validation revisions remain enforced; increasing the turn budget never bypasses feasibility checks.
+## Submission checklist
 
-The OpenAI-compatible session reserves the final two turns by offering only `submit_plan` with forced native function choice. The server still validates that submission, and the last turn can correct a rejected draft. This prevents a final tool validation from consuming every turn without returning a Decision. No invalid plan is auto-approved at the turn limit.
-
-OpenAI tool declarations use the SDK's strict Pydantic schemas, including `submit_plan`, so mandatory Price objects cannot be emitted as null. Groq retains its compatible non-strict declarations. Python tool validation still runs independently and returns safe field/type/message hints without raw input, allowing bounded correction of semantic errors.
-
-Live infeasibility handling now challenges the first unsupported model claim once, asking for a simpler one- or two-stop plan under the original hard constraints. Interests and crowd preferences are best effort; estimated costs and unknown evidence are disclosed rather than treated as automatic infeasibility. Continued inability to find a validated proposal returns `failure` with a scoped explanation. Repeated invalid drafts also return search failure after the existing two-revision bound, and remain unapproved.
-
-The supplied start time is arrival/window start, not an exact first-activity time. A 15:00 arrival with a ten-minute buffer permits a 15:10 activity, while the four-hour deadline remains 19:00. Scheduling errors now include the earliest permitted activity start so the model can make a concrete correction. Regression tests cover this afternoon driving scenario, unknown prices, crowd warnings and recovery from premature infeasibility.
-
-A bounded recovery can shorten an LLM draft to one discovered venue when route evidence or scheduling prevents the larger plan. It preserves the original activity duration and cost, applies the first buffer within the original deadline, retains any supplied origin and required recorded route, recalculates the cost, and revalidates all hard checks. The trace labels this `simplify_plan`; it is not presented as a fabricated model tool call. Recovery consumes the existing two-revision and 24-tool budgets. It cannot bypass explicit dietary conflicts, the budget, opening hours, an unresolved starting neighborhood or missing required route evidence. Omitted interests and uncertain crowd/music evidence are disclosed.
-
-
-## Choosing between plans
-
-The UI defaults to an 11:00 start, four hours, INR 2,000, walking, food and walks, with vegetarian and crowd preferences. The assignment example remains a separate preset. Defaults favour a simple daytime outing; live hours and prices still need confirmation.
-
-After the native LLM tool-calling run, `Planner.add_alternatives` compares up to three distinct options using discovered venues and existing prices. Shorter options explain omitted interests, retain the original hard constraints, recalculate costs and pass the same independent validator. Known Saturday hours can shift a stop later inside the original window. Comparison is a traced business-rule phase (`compare_options`), not an extra LLM call. It shares the 24-tool cap. If fewer options can be supported, the UI says so rather than fabricating choices. API failures without usable evidence remain failures. The offline demo supports the same choice UI with labelled fixtures.
-
-Selecting an option updates its itinerary, budget, warnings and downloaded JSON. The export retains all choices and the real trace. Budget clarity uses an itemized range-and-basis table. Unknown costs keep the complete total and remaining budget unknown; the known subtotal is shown separately.
+- GitHub repository: [rishabh-soni/perfect-saturday-planner](https://github.com/rishabh-soni/perfect-saturday-planner).
+- Local setup/run instructions, architecture, configuration, tests and AI-tool disclosure: this README.
+- Hosted public URL: **pending**; the project has not been deployed.
+- Optional demo video: not included.

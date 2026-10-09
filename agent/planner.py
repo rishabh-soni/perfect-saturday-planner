@@ -11,19 +11,25 @@ from pydantic import ValidationError
 from agent.prompts import SYSTEM_PROMPT
 from agent.schemas import (Decision, Itinerary, Place, PlanOption, PlannerResult, Preferences,
                            Price, Route, Stop, TraceEvent, ValidationResult, clock_minutes, clock_string)
-from providers.google import GoogleProvider
+from providers.google import GoogleProvider, ProviderError
+from providers.cache import ProviderCache
+from providers.nominatim import NominatimProvider
+from providers.osm import OverpassProvider, distance_meters
+from providers.weather import OpenMeteoProvider
 from providers.llm import ModelError, ToolResult
 from providers.mock import MockProvider
 from tools.budget import BudgetArguments, estimate_cost
+from tools.weather import WeatherArguments
 from tools.places import SearchArguments, search_places
 from tools.routing import RouteArguments, get_route
 from tools.validator import ValidationArguments, opening_check, validate_plan
 
 
 TOOL_MODELS = {"search_places": SearchArguments, "get_route": RouteArguments,
-               "estimate_cost": BudgetArguments, "validate_plan": ValidationArguments}
+               "estimate_cost": BudgetArguments, "validate_plan": ValidationArguments, "get_weather": WeatherArguments}
 DESCRIPTIONS = {
-    "search_places": "Discover venues in the requested city. Missing Google key/failure falls back to labeled Bengaluru mock fixtures.",
+    "search_places": "Discover actual OSM venues around the submitted city/neighborhood anchor. Search tag categories, reuse the cached compact area. Missing metadata is unknown; service failure may use labeled Bengaluru fixtures.",
+    "get_weather": "Read retrieved Open-Meteo hourly weather for the original Saturday and window. It is already in context; repeat reads reuse it. Prefer indoor activities in adverse conditions.",
     "get_route": "Get walking/driving route between discovered place IDs or their exact coordinates. Failure is unavailable, mock routes are estimates.",
     "estimate_cost": "Calculate INR itemized upper/lower estimated costs against the user's original budget. Unknown costs remain unknown.",
     "validate_plan": "Check chronology, route evidence, time, original budget, hard constraints, Saturday hours and critical unknowns. Original preferences are enforced.",
@@ -51,7 +57,7 @@ class Planner:
     MAX_REVISIONS = 2
     MAX_TOOL_CALLS = 24
 
-    def __init__(self, *, client=None, llm=None, google=None, mock=None, model=None, places_mode="auto", on_event=None):
+    def __init__(self, *, client=None, llm=None, google=None, mock=None, model=None, places_mode="auto", on_event=None, osm=None, geocoder=None, weather=None, cache=None):
         try:
             configured_limit = int(os.getenv("AGENT_MAX_ITERATIONS", str(self.MAX_ITERATIONS)))
         except ValueError:
@@ -64,6 +70,7 @@ class Planner:
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         self.places_mode = places_mode
         self.on_event = on_event
+        self.osm, self.geocoder, self.weather_provider, self.provider_cache = osm, geocoder, weather, cache
 
     def _reset(self):
         self.catalog = {}
@@ -74,6 +81,8 @@ class Planner:
         self.infeasible_retry_used = False
         self.last_candidate = None
         self.executed_tools = set()
+        self.location = self.weather_data = self.origin_place_id = None
+        self.provider_warnings = []
 
     def _record(self, name, args, started, success, summary):
         event = TraceEvent(name=name, arguments=sanitize(args),
@@ -96,7 +105,11 @@ class Planner:
             if name == "search_places":
                 # Model cannot change user city to find more convenient fixtures.
                 args["city"] = self.preferences.city
-                result = search_places(**args, google=self.google, mock=self.mock)
+                result = search_places(**args, osm=self.osm if self.places_mode != "mock" else None,
+                                       primary_osm=self.places_mode != "mock", mock=self.mock)
+                result["weather"] = self.weather_data
+                result["origin"] = self.catalog[self.origin_place_id].model_dump(mode="json") if self.origin_place_id else None
+                self.provider_warnings.extend(w for w in result.get("warnings", []) if w not in self.provider_warnings)
                 for data in result["places"]:
                     place = Place.model_validate(data)
                     self.catalog[place.place_id] = place
@@ -104,7 +117,7 @@ class Planner:
                 summary = f"{len(result['places'])} places from {result['source']} ({result['status']})"
             elif name == "get_route":
                 args["travel_mode"] = self.preferences.travel_mode
-                result = get_route(**args, catalog=self.catalog, google=self.google, mock=self.mock)
+                result = get_route(**args, catalog=self.catalog, google=self.google, mock=self.mock, route_cache=self.routes)
                 route = Route.model_validate(result)
                 self.routes[(route.origin_id, route.destination_id, route.travel_mode)] = route
                 success = route.status != "unavailable"
@@ -113,10 +126,14 @@ class Planner:
                 result = estimate_cost(**args, budget=self.preferences.budget)
                 success = not result["unknown_cost_items"]
                 summary = f"INR upper estimate {result['total_estimated_cost']}; {len(result['unknown_cost_items'])} unknown costs"
+            elif name == "get_weather":
+                result = self.weather_data or {"status": "unavailable", "hourly": [], "guidance": "No forecast in mock/demo mode"}
+                success = result["status"] == "available"
+                summary = f"Weather {result['status']}; original Saturday/time window retained"
             else:
                 self.last_candidate = parsed.itinerary.model_copy(deep=True)
                 args["preferences"] = self.preferences.model_dump(mode="json")
-                result = validate_plan(**args, catalog=self.catalog, routes=self.routes)
+                result = validate_plan(**args, catalog=self.catalog, routes=self.routes, weather=self.weather_data)
                 success = result["passed"]
                 summary = f"Validation {result['status']}; {len(result['errors'])} errors, {len(result['warnings'])} warnings"
             self.executed_tools.add(name)
@@ -225,7 +242,8 @@ class Planner:
         return PlannerResult(status=status, mode=mode, message=message,
                              preferences=self.preferences.context() if hasattr(self, "preferences") else None,
                              itinerary=hydrated, validation=validation, trace=self.trace,
-                             iterations=self.iterations, revisions=self.revisions)
+                             iterations=self.iterations, revisions=self.revisions, weather=self.weather_data,
+                             location=self.location, provider_warnings=self.provider_warnings)
 
     def add_alternatives(self, result, *, limit=3):
         """Compare bounded, evidence-backed variants after the genuine agent run.
@@ -273,6 +291,8 @@ class Planner:
                 cost=place.estimated_price or Price(minimum=None, maximum=None, confidence="unknown",
                     basis="No current menu or admission price was supplied by the place provider"),
                 rationale="Prioritizes one of your interests with fewer stops and less travel."))
+        if self.weather_data and self.weather_data.get("prefer_indoor"):
+            candidates.sort(key=lambda stop: self.catalog[stop.place_id].environment != "indoor")
         for stop in candidates:
             if len(options) >= min(3, max(1, limit)) or self.tool_calls > self.MAX_TOOL_CALLS - 3:
                 break
@@ -312,6 +332,8 @@ class Planner:
             candidate = Itinerary(title=f"A slower Saturday: {place.name}", stops=[selected],
                 starting_place_id=origin, transport_cost=base.transport_cost,
                 warnings=["Venue hours, prices and crowd levels require the confirmations listed below."], trade_offs=trade_offs)
+            if self.weather_data and self.weather_data.get("prefer_indoor") and place.environment == "indoor":
+                candidate.trade_offs.append("An indoor venue is preferred because the retrieved forecast indicates adverse outdoor conditions.")
             self._execute("estimate_cost", {"activities": [{"label": selected.activity, "cost": selected.cost.model_dump()}],
                                            "transport_cost": candidate.transport_cost.model_dump()})
             validation = self._validation(candidate)
@@ -332,6 +354,56 @@ class Planner:
         result.trace = list(self.trace)
         return result
 
+    def _prepare_context(self):
+        """Resolve only user-submitted locations, then fetch one cached forecast."""
+        if self.places_mode == "mock":
+            return True
+        cache = self.provider_cache or ProviderCache()
+        self.geocoder = self.geocoder or NominatimProvider(cache=cache)
+        self.weather_provider = self.weather_provider or OpenMeteoProvider(cache=cache)
+        started = perf_counter()
+        try:
+            self.location = self.geocoder.resolve(self.preferences.city)
+            self._record("resolve_city", {"city": self.preferences.city}, started, True,
+                         f"Nominatim resolved city; cached={self.location.get('cached', False)}")
+        except ProviderError as exc:
+            self.provider_warnings.append(str(exc))
+            self._record("resolve_city", {"city": self.preferences.city}, started, False, str(exc))
+            self.osm = None
+            self.weather_data = {"status": "unavailable", "hourly": [], "prefer_indoor": False,
+                "guidance": "Location unresolved; weather cannot be retrieved. Keep an indoor backup.", "warnings": [str(exc)]}
+            return not self.preferences.starting_neighborhood
+        anchor = self.location
+        if self.preferences.starting_neighborhood:
+            started = perf_counter()
+            try:
+                anchor = self.geocoder.resolve(self.preferences.city, self.preferences.starting_neighborhood)
+                if distance_meters((anchor["latitude"], anchor["longitude"]),
+                                   (self.location["latitude"], self.location["longitude"])) > 50000:
+                    raise ProviderError("Starting neighborhood resolved too far from the requested city; clarify the location")
+                origin = Place(place_id=f"origin:{anchor['osm_type']}:{anchor['osm_id']}",
+                    name=anchor["display_name"], address=anchor["display_name"], latitude=anchor["latitude"],
+                    longitude=anchor["longitude"], source="nominatim", types=["origin"],
+                    resolved_neighborhood=self.preferences.starting_neighborhood,
+                    notes=["Geocoded neighborhood reference point, not a venue or precise home address. © OpenStreetMap contributors · ODbL"])
+                self.catalog[origin.place_id] = origin
+                self.origin_place_id = origin.place_id
+                self._record("resolve_starting_neighborhood", {"city": self.preferences.city, "neighborhood": self.preferences.starting_neighborhood},
+                    started, True, f"Resolved starting reference point {origin.place_id}; cached={anchor.get('cached', False)}")
+            except ProviderError as exc:
+                self._record("resolve_starting_neighborhood", {"neighborhood": self.preferences.starting_neighborhood}, started, False, str(exc))
+                self.provider_warnings.append(str(exc))
+                return False
+        self.osm = self.osm or OverpassProvider(anchor=anchor, cache=cache)
+        self.osm.anchor = anchor
+        started = perf_counter()
+        self.weather_data = self.weather_provider.forecast(anchor, self.preferences)
+        self.osm.prefer_indoor = self.weather_data.get("prefer_indoor", False)
+        self._record("get_weather", {"saturday": str(self.preferences.saturday), "start_time": self.preferences.start_time,
+            "duration_minutes": self.preferences.duration_minutes}, started, self.weather_data["status"] == "available",
+            f"Open-Meteo {self.weather_data['status']}; {self.weather_data.get('guidance', '')}; cached={self.weather_data.get('cached', False)}")
+        return True
+
     def plan(self, input_data, *, offline=False):
         self._reset()
         if hasattr(self, "preferences"):
@@ -346,7 +418,11 @@ class Planner:
         self._record("parse_preferences", self.preferences.context(), started, True,
                      f"Normalized {self.preferences.city}; {self.preferences.duration_minutes} minutes; INR {self.preferences.budget}")
         if offline:
-            return self._offline()
+            original_mode = self.places_mode
+            try:
+                return self._offline()
+            finally:
+                self.places_mode = original_mode
         owned = self.llm is None
         if owned:
             if self.client is None and not os.getenv("OPENAI_API_KEY", "").strip():
@@ -359,6 +435,8 @@ class Planner:
         try:
             if self.google is None and self.places_mode != "mock" and os.getenv("GOOGLE_MAPS_API_KEY"):
                 self.google = GoogleProvider(os.environ["GOOGLE_MAPS_API_KEY"])
+            if not self._prepare_context():
+                return self._result("failure", "The starting neighborhood could not be resolved reliably. Clarify it or omit it; no origin or journey was invented.", "agent")
             return self._agent()
         finally:
             if owned:
@@ -368,7 +446,8 @@ class Planner:
     def _agent(self):
         last_plan = last_validation = None
         try:
-            session = self.llm.start(SYSTEM_PROMPT + f"\nYou have {self.max_iterations} model turns total. Reserve turns for validation, correction and submit_plan.", self.preferences.context(), TOOL_MODELS, DESCRIPTIONS)
+            session = self.llm.start(SYSTEM_PROMPT + f"\nYou have {self.max_iterations} model turns total. Reserve turns for validation, correction and submit_plan.", {**self.preferences.context(), "location": self.location, "weather": self.weather_data,
+                    "starting_origin": self.catalog[self.origin_place_id].model_dump(mode="json") if self.origin_place_id else None}, TOOL_MODELS, DESCRIPTIONS)
         except Exception:
             return self._result("failure", "Could not initialize model session. Check configuration or use the demo.", "agent")
         for iteration in range(1, self.max_iterations + 1):
@@ -457,7 +536,8 @@ class Planner:
 
     def _offline(self):
         # No LLM impersonation: this is a small reproducible demonstration of the tools.
-        self.google = None
+        self.google = self.osm = None
+        self.places_mode = "mock"
         prefs = self.preferences
         result = self._search(" ".join(prefs.interests))
         if not result.get("places"):

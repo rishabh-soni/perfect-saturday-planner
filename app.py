@@ -24,7 +24,7 @@ def configure():
         secrets = st.secrets.to_dict()
     except FileNotFoundError:
         secrets = {}
-    for name in ("OPENAI_API_KEY", "GOOGLE_MAPS_API_KEY", "OPENAI_MODEL", "OPENAI_DIAGNOSTICS", "AGENT_MAX_ITERATIONS", "SATURDAY_DEMO_ONLY"):
+    for name in ("OPENAI_API_KEY", "GOOGLE_MAPS_API_KEY", "OPENAI_MODEL", "OPENAI_DIAGNOSTICS", "AGENT_MAX_ITERATIONS", "SATURDAY_DEMO_ONLY", "OSM_USER_AGENT", "NOMINATIM_URL", "OVERPASS_URL", "OPEN_METEO_URL", "OSM_SEARCH_RADIUS_METERS", "PROVIDER_CACHE_PATH", "ROUTING_FALLBACK", "APP_PUBLIC_URL", "MAP_TILE_URL", "MAP_TILE_ATTRIBUTION"):
         if not os.getenv(name) and secrets.get(name):
             os.environ[name] = str(secrets[name])
 
@@ -61,9 +61,9 @@ def run():
             elif demo:
                 st.caption("Illustrative places and estimates. No live AI or API calls.")
             elif not settings["google"]:
-                st.caption("AI planning is available; venue and route data will use labeled Bengaluru fixtures.")
+                st.caption("AI planning with OpenStreetMap places and weather; short-distance routing uses labeled estimates when Google Routes is unavailable.")
             else:
-                st.caption("Personalized AI planning. Live place data is used when available.")
+                st.caption("AI planning with OpenStreetMap places, Open-Meteo weather and Google Routes.")
             with st.form("saturday_preferences", border=False):
                 st.markdown('<div class="section-label">THE PRACTICAL BITS</div>', unsafe_allow_html=True)
                 st.text_input("City", key="city", max_chars=120, placeholder="Bangalore")

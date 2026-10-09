@@ -5,6 +5,7 @@ from datetime import date, datetime
 import streamlit as st
 
 from ui.controller import budget_categories, event_label, maps_url
+from ui.map import itinerary_map
 
 
 def esc(value) -> str:
@@ -60,14 +61,14 @@ def route_segment(route: dict):
     mode = "Walk" if route.get("travel_mode") == "walking" else "Drive"
     distance = route.get("distance_meters")
     distance_text = "Distance unknown" if distance is None else (f"{distance / 1000:.1f} km" if distance >= 1000 else f"{distance:.0f} m")
-    label = "Illustrative demo estimate" if route.get("source") == "mock" else "Provider estimate" if route.get("status") == "available" else "Route unavailable"
+    label = "Illustrative demo estimate" if route.get("source") == "mock" else "Approximate distance fallback · navigation unverified" if route.get("source") == "distance_estimate" else "Google Maps · provider estimate" if route.get("source") == "google_routes" and route.get("status") == "available" else "Route unavailable"
     st.markdown(f'<div class="route">{esc(mode)} &nbsp; · &nbsp; {esc(duration(route.get("duration_minutes")))} &nbsp; · &nbsp; {esc(distance_text)}<br>{esc(label)}</div>', unsafe_allow_html=True)
 
 
 def activity_card(stop: dict, number: int):
     venue = stop.get("venue") or {}
     is_mock = venue.get("source") == "mock"
-    label = "Demo venue · check details" if is_mock else "Place found · check hours" if venue else "Venue unverified"
+    label = "Demo venue · check details" if is_mock else "OpenStreetMap · community tags" if venue.get("source") == "openstreetmap" else "Place found · check hours" if venue else "Venue unverified"
     url = maps_url(venue)
     link = f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">Find on Maps ↗</a>' if url else ""
     rating = f'<span>Rating {esc(venue["rating"])} / 5</span>' if venue.get("rating") is not None else ""
@@ -82,14 +83,19 @@ def activity_card(stop: dict, number: int):
             st.text(stop["cost"].get("basis", "Price basis unavailable"))
         hours = venue.get("opening_hours")
         descriptions = hours.get("weekdayDescriptions", []) if hours else []
-        if descriptions:
+        if hours and hours.get("osm_expression"):
+            st.text("OSM opening_hours: " + hours["osm_expression"])
+            st.caption("Community-supplied weekly hours; complex expressions and holiday exceptions may require manual confirmation.")
+        elif descriptions:
             st.caption("Regular opening hours from the venue provider; confirm Saturday exceptions.")
             for line in descriptions:
                 st.text(line)
         else:
             st.warning("Opening hours are unknown. Confirm before you go.")
+        if venue.get("cuisine"):
+            st.caption("OSM cuisine tag: " + venue["cuisine"])
         if venue.get("evidence", {}).get("vegetarian") is True:
-            st.caption("Vegetarian options are indicated by " + ("the demo fixture; confirm the current menu." if is_mock else "the place provider; confirm the current menu."))
+            st.caption("Vegetarian options are indicated by " + ("the demo fixture; confirm the current menu." if is_mock else "OpenStreetMap community tags; confirm the current menu." if venue.get("source") == "openstreetmap" else "the place provider; confirm the current menu."))
         for note in venue.get("notes", []):
             st.text(note)
         if is_mock and url:
@@ -136,6 +142,24 @@ def trace_section(result):
             st.json(result.get("trace", []))
 
 
+def weather_view(weather):
+    if not weather:
+        return
+    with st.expander("Saturday weather", expanded=True):
+        st.caption("Weather by [Open-Meteo.com](https://open-meteo.com/) · CC BY 4.0 · forecast, not a guarantee")
+        if weather.get("status") == "unavailable":
+            st.warning(weather.get("guidance", "Forecast unavailable; check before departure."))
+        else:
+            st.text(weather.get("guidance", ""))
+            st.caption(f"{weather.get('window_start', '')} to {weather.get('window_end', '')} · {weather.get('timezone', 'local time')}")
+            rows = [{"Local hour": h["time"][11:16], "Rain probability": "Unknown" if h.get("precipitation_probability") is None else f"{h['precipitation_probability']}%",
+                     "Temperature": "Unknown" if h.get("temperature_c") is None else f"{h['temperature_c']} °C",
+                     "WMO code": "Unknown" if h.get("weather_code") is None else str(h["weather_code"])} for h in weather.get("hourly", [])]
+            st.table(rows)
+        for warning in weather.get("warnings", []):
+            st.caption(warning)
+
+
 def result_view(result):
     itinerary, validation = result.get("itinerary"), result.get("validation") or {}
     if result["status"] in {"failure", "infeasible"}:
@@ -168,6 +192,8 @@ def result_view(result):
               (str(len(itinerary.get("stops", []))), "STOPS")]
     st.markdown('<div class="stats">' + ''.join(f'<div class="stat"><b>{esc(v)}</b><span>{esc(label)}</span></div>' for v, label in values) + '</div>', unsafe_allow_html=True)
     st.caption(f"{prefs.get('saturday', '')} · {prefs.get('mood', '')} · Saved for your submitted preferences")
+    weather_view(result.get("weather"))
+    itinerary_map(itinerary)
     routes = {(r["origin_id"], r["destination_id"]): r for r in itinerary.get("routes", [])}
     previous = itinerary.get("starting_place_id")
     for number, stop in enumerate(itinerary.get("stops", []), 1):
@@ -180,7 +206,7 @@ def result_view(result):
         activity_card(stop, number)
         previous = stop["place_id"]
     spending(itinerary, validation, prefs)
-    warnings = list(dict.fromkeys(itinerary.get("warnings", []) + validation.get("warnings", [])))
+    warnings = list(dict.fromkeys(itinerary.get("warnings", []) + validation.get("warnings", []) + result.get("provider_warnings", [])))
     if warnings:
         with st.expander(f"Before you go · {len(warnings)} things to know"):
             for warning in warnings:

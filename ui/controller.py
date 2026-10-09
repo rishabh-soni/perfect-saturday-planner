@@ -91,6 +91,10 @@ def maps_url(venue: dict) -> str | None:
     name, address = venue.get("name"), venue.get("address")
     if not name:
         return None
+    if venue.get("source") == "openstreetmap":
+        match = re.fullmatch(r"osm:(node|way|relation):(\d+)", venue.get("place_id", ""))
+        if match:
+            return f"https://www.openstreetmap.org/{match[1]}/{match[2]}"
     params = {"api": "1", "query": ", ".join(filter(None, [name, address]))}
     if venue.get("source") == "google_places":
         if venue.get("place_id"):
@@ -121,6 +125,9 @@ def budget_categories(itinerary: dict) -> list[dict]:
 
 
 EVENT_LABELS = {
+    "resolve_city": "Locating your city",
+    "resolve_starting_neighborhood": "Locating your starting area",
+    "get_weather": "Checking Saturday weather",
     "compare_options": "Comparing your options",
     "simplify_plan": "Checking a shorter plan",
     "infeasibility_review": "Trying a simpler Saturday",

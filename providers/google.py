@@ -64,6 +64,10 @@ class GoogleProvider:
 
     def route(self, origin: Place, destination: Place, travel_mode: str):
         def waypoint(place):
+            if place.source in {"openstreetmap", "nominatim"}:
+                if place.latitude is None or place.longitude is None:
+                    raise ProviderError("OSM endpoint coordinates are missing")
+                return {"location": {"latLng": {"latitude": place.latitude, "longitude": place.longitude}}}
             return {"placeId": place.place_id}
         data = self._post("https://routes.googleapis.com/directions/v2:computeRoutes",
                           {"origin": waypoint(origin), "destination": waypoint(destination),
@@ -80,6 +84,6 @@ class GoogleProvider:
             return Route(origin_id=origin.place_id, destination_id=destination.place_id,
                          travel_mode=travel_mode, distance_meters=distance, duration_minutes=minutes,
                          status="available", source="google_routes", confidence="provider_estimate",
-                         warning="Provider estimate; Saturday traffic and delays may differ")
+                         warning="Google Maps route estimate; Saturday traffic and delays may differ. Coordinates may snap to roads; confirm venue entrances.")
         except (IndexError, KeyError, TypeError, ValueError, AttributeError):
             raise ProviderError("Google Routes returned no usable route") from None

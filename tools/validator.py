@@ -1,5 +1,7 @@
 """Independent validation against provider evidence, never model assertions."""
 from math import ceil
+from tools.osm_hours import osm_opening_check
+from providers.weather import adverse_hour
 
 from agent.schemas import Itinerary, Place, Preferences, Route, Schema, ValidationResult, clock_minutes, clock_string
 from tools.budget import estimate_cost
@@ -15,6 +17,8 @@ def opening_check(place: Place, start: int, end: int) -> bool | None:
     hours = place.opening_hours
     if hours is None:
         return None
+    if "osm_expression" in hours:
+        return osm_opening_check(hours["osm_expression"], start, end)
     periods = hours.get("periods")
     if periods is None:
         return None
@@ -39,7 +43,7 @@ def opening_check(place: Place, start: int, end: int) -> bool | None:
         return None
 
 
-def validate_plan(itinerary, preferences, *, catalog=None, routes=None) -> dict:
+def validate_plan(itinerary, preferences, *, catalog=None, routes=None, weather=None) -> dict:
     plan = Itinerary.model_validate(itinerary)
     prefs = Preferences.model_validate(preferences)
     catalog, routes = catalog or {}, routes or {}
@@ -51,7 +55,9 @@ def validate_plan(itinerary, preferences, *, catalog=None, routes=None) -> dict:
     previous_id = plan.starting_place_id
     if prefs.starting_neighborhood:
         origin = catalog.get(previous_id)
-        if origin is None or prefs.starting_neighborhood.casefold() not in (origin.address + " " + origin.name).casefold():
+        if origin is None or not (
+            prefs.starting_neighborhood.casefold() in (origin.address + " " + origin.name).casefold() or
+            (origin.source == "nominatim" and origin.resolved_neighborhood == prefs.starting_neighborhood)):
             errors.append("Starting neighborhood requires a discovered matching origin and route to the first stop")
     elif previous_id is None:
         warnings.append("Window starts at the first venue; travel from home and return travel are excluded")
@@ -71,7 +77,7 @@ def validate_plan(itinerary, preferences, *, catalog=None, routes=None) -> dict:
                 route_minutes = route.duration_minutes
                 if route.status == "estimated":
                     critical_unknown = True
-                    warnings.append(f"Unverified mock route: {previous_id} -> {stop.place_id}")
+                    warnings.append(f"Unverified {route.source} route: {previous_id} -> {stop.place_id}; {route.warning or 'confirm navigation'}")
         earliest = ceil(previous_end + route_minutes + stop.buffer_minutes)
         if begin < earliest:
             earliest_text = clock_string(earliest) if earliest < 1440 else "after midnight"
@@ -82,6 +88,22 @@ def validate_plan(itinerary, preferences, *, catalog=None, routes=None) -> dict:
         if place is None:
             errors.append(f"Venue not discovered by tools: {stop.place_id}")
         else:
+            if place.source == "nominatim" or "origin" in place.types:
+                errors.append("A geocoded starting point is not a discovered activity venue")
+            if weather is not None:
+                if weather.get("status") not in {"available", "partial"}:
+                    critical_unknown = True
+                    warnings.append("Weather forecast unavailable; check before departure and keep an indoor backup")
+                elif place.environment == "outdoor" or stop.kind == "walk":
+                    relevant = [h for h in weather.get("hourly", []) if
+                        h["time"][:10] == prefs.saturday.isoformat() and
+                        clock_minutes(h["time"][11:16]) < end and clock_minutes(h["time"][11:16]) + 60 > begin]
+                    if any(adverse_hour(h) for h in relevant):
+                        critical_unknown = True
+                        warnings.append(f"Adverse weather forecast overlaps outdoor stop: {place.name}; prefer an indoor alternative or confirm conditions")
+                    if weather.get("status") == "partial":
+                        critical_unknown = True
+                        warnings.append("Weather forecast is partial; some outdoor conditions are unknown")
             is_food = stop.kind == "food" or any(t in place.types for t in ("restaurant", "cafe", "food"))
             if place.source == "mock":
                 critical_unknown = True

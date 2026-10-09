@@ -282,3 +282,22 @@ def test_unknown_cost_table_keeps_total_unknown(app):
     assert not app.exception and len(app.table) == 1
     assert any("Complete total and budget left are unknown" in w.value for w in app.warning)
     assert any("Known costs only" in t.value for t in app.text)
+
+
+def test_streamlit_weather_and_map_are_shown_without_network(app):
+    from tests.test_osm_integration import elements, normalize_element
+    submit(app)
+    result = app.session_state["result"]
+    result["alternatives"] = []
+    result["weather"] = {"status": "available", "timezone": "Asia/Kolkata", "window_start": "2026-10-10T11:00",
+        "window_end": "2026-10-10T15:00", "guidance": "Prefer an indoor backup", "hourly": [
+            {"time": "2026-10-10T11:00", "precipitation_probability": 80, "temperature_c": 26, "weather_code": 95}]}
+    result["itinerary"]["stops"][0]["venue"] = normalize_element(elements()[0]).model_dump(mode="json")
+    app.session_state["result"] = result
+    app.run()
+    assert not app.exception
+    assert any(e.label == "Saturday weather" for e in app.expander)
+    assert any(e.label == "Your stops on the map" for e in app.expander)
+    assert len(app.table) == 2
+    assert any("Open-Meteo" in c.value for c in app.caption)
+    assert any("Dotted links show stop order" in c.value for c in app.caption)

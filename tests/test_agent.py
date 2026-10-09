@@ -207,7 +207,7 @@ def test_trace_redacts_nested_secrets(monkeypatch):
 
 def test_strict_function_schemas():
     definitions = declarations(TOOL_MODELS, DESCRIPTIONS)
-    assert len(definitions) == 5
+    assert len(definitions) == 6
     assert definitions[-1]["function"]["name"] == "submit_plan"
     assert all(d["function"]["parameters"]["additionalProperties"] is False for d in definitions)
 
@@ -247,7 +247,7 @@ def test_real_sdk_function_calling_with_mock_http_transport(backend, base_url, m
     assert result.status == "conditional", result.model_dump_json()
     assert len(seen) == 3 and seen[0]["model"] == model
     assert seen[0]["tool_choice"] == "required"
-    assert len(seen[0]["tools"]) == 5 and "response_format" not in seen[0]
+    assert len(seen[0]["tools"]) == 6 and "response_format" not in seen[0]
     outputs = [m for m in seen[2]["messages"] if m["role"] == "tool"]
     assert [m["tool_call_id"] for m in outputs] == ["search", "route", "cost", "validate"]
     assert json.loads(outputs[0]["content"])["result"]["places"]

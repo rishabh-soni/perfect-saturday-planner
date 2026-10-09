@@ -126,7 +126,11 @@ class Place(Schema):
     rating: float | None = Field(default=None, ge=0, le=5)
     opening_hours: dict | None = None
     price_level: str | None = None
-    source: Literal["google_places", "mock"]
+    source: Literal["google_places", "openstreetmap", "nominatim", "mock"]
+    cuisine: str | None = None
+    osm_tags: dict[str, str] = Field(default_factory=dict)
+    environment: Literal["indoor", "outdoor", "unknown"] = "unknown"
+    resolved_neighborhood: str | None = None
     types: list[str] = Field(default_factory=list)
     evidence: dict[str, bool] = Field(default_factory=dict)
     estimated_price: Price | None = None
@@ -152,7 +156,7 @@ class Route(Schema):
     distance_meters: float | None = Field(ge=0)
     duration_minutes: float | None = Field(ge=0)
     status: Literal["available", "estimated", "unavailable"]
-    source: Literal["google_routes", "mock", "unavailable"]
+    source: Literal["google_routes", "distance_estimate", "mock", "unavailable"]
     confidence: Literal["provider_estimate", "low", "unavailable"]
     warning: str | None
 
@@ -227,3 +231,6 @@ class PlannerResult(Schema):
     iterations: int = 0
     revisions: int = 0
     alternatives: list[PlanOption] = Field(default_factory=list)
+    weather: dict | None = None
+    location: dict | None = None
+    provider_warnings: list[str] = Field(default_factory=list)
