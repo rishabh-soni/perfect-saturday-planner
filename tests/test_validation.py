@@ -171,3 +171,23 @@ def test_driving_free_cost_rejected():
 def test_fabricated_verified_prices_rejected():
     result = validate(plan([stop(cost=price(10, 10, "verified"))]))
     assert any("Verified activity price unsupported" in e for e in result["errors"])
+
+
+def test_first_activity_can_start_after_arrival_buffer():
+    draft = plan([stop("mock:koshys", "15:10", "16:00", cost=price(350, 650), kind="food")])
+    draft["transport_cost"] = price(150, 300)
+    result = validate(draft, {"start_time": "15:00", "travel_mode": "driving"})
+    assert not result["errors"] and result["status"] == "conditional"
+    assert result["total_minutes"] == 60
+
+
+def test_first_buffer_error_supplies_actionable_start_time():
+    draft = plan([stop(start="15:00", end="15:30")])
+    result = validate(draft, {"start_time": "15:00"})
+    assert any("earliest activity start is 15:10" in e for e in result["errors"])
+
+
+def test_shifted_first_activity_still_cannot_exceed_original_deadline():
+    draft = plan([stop(start="15:10", end="19:01")])
+    result = validate(draft, {"start_time": "15:00"})
+    assert any("Available time exceeded" in e for e in result["errors"])

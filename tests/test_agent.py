@@ -4,36 +4,48 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from agent.planner import Planner, sanitize, tool_definitions
+from agent.planner import Planner, sanitize, TOOL_MODELS, DESCRIPTIONS
+from providers.llm import ModelTurn, ToolRequest, ModelError
+from providers.groq import declarations, api_error_message
 from agent.schemas import Decision, Itinerary, Preferences
 from main import EXAMPLE
 from tests.test_validation import plan, price, stop
 
 
 class ScriptedResponses:
-    """API double: validates protocol while choosing tool calls per scripted turn."""
+    name = "Scripted"
     def __init__(self, steps):
         self.steps = iter(steps)
         self.requests = []
+        self.history = []
 
-    def parse(self, **kwargs):
-        self.requests.append(list(kwargs["input"]))
-        return next(self.steps)(kwargs)
+    def start(self, *args):
+        return self
+
+    def next_turn(self):
+        self.requests.append(list(self.history))
+        return next(self.steps)({})
+
+    def respond(self, results):
+        self.history.extend({"type": "function_call_output", "call_id": r.request.call_id,
+                             "output": json.dumps(r.output)} for r in results)
+
+    def feedback(self, message):
+        self.history.append({"role": "user", "content": message})
 
 
 def call(name, args, identifier):
-    item = SimpleNamespace(type="function_call", name=name, arguments=json.dumps(args), call_id=identifier)
-    return lambda _: SimpleNamespace(output=[item], output_parsed=None)
+    return lambda _: ModelTurn(calls=[ToolRequest(name, args, identifier)])
 
 
 def final(draft):
-    return lambda _: SimpleNamespace(output=[], output_parsed=Decision(
+    return lambda _: ModelTurn(decision=Decision(
         status="recommendation", message="Short nearby stops suit your tired mood.", itinerary=Itinerary.model_validate(draft)))
 
 
 def planner_with(steps):
     responses = ScriptedResponses(steps)
-    return Planner(client=SimpleNamespace(responses=responses), places_mode="mock"), responses
+    return Planner(llm=responses, places_mode="mock"), responses
 
 
 def search_step():
@@ -74,11 +86,11 @@ def test_offline_unknown_city_relaxes_once():
 
 
 def test_live_agent_empty_search_has_one_server_retry():
-    infeasible = lambda _: SimpleNamespace(output=[], output_parsed=Decision(
+    infeasible = lambda _: ModelTurn(decision=Decision(
         status="infeasible", message="No mock venues in this city", itinerary=None))
-    planner, responses = planner_with([search_step(), infeasible])
+    planner, responses = planner_with([search_step(), infeasible, infeasible])
     result = planner.plan({**EXAMPLE, "city": "Delhi"})
-    assert result.status == "infeasible"
+    assert result.status == "failure"
     assert sum(e.name == "search_places" for e in result.trace) == 2
     assert sum(e.name == "relax_soft_preferences" for e in result.trace) == 1
     tool_output = next(i for i in responses.requests[1] if isinstance(i, dict) and i.get("type") == "function_call_output")
@@ -129,10 +141,11 @@ def test_only_two_revisions_allowed():
     bad = final(plan([stop(end="15:00")]))
     planner, _ = planner_with([search_step(), budget_step(), bad, bad, bad])
     result = planner.plan(EXAMPLE)
-    assert result.status == "infeasible" and result.revisions == 2
+    assert result.status == "failure" and result.revisions == 2
 
 
-def test_six_iteration_limit():
+def test_configured_six_iteration_limit(monkeypatch):
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "6")
     planner, _ = planner_with([search_step()] * 6)
     result = planner.plan(EXAMPLE)
     assert result.status == "failure" and result.iterations == 6
@@ -174,6 +187,18 @@ def test_input_failure_and_planner_reuse_reset():
     assert len(result.trace) == 1
 
 
+@pytest.mark.parametrize("code,phrase", [(429, "quota"), (403, "denied access"),
+                                        (404, "model is unavailable"), (503, "temporarily unavailable")])
+def test_billing_failure_shows_actionable_message_without_raw_error(code, phrase):
+    def failure(_):
+        raise ModelError(api_error_message(SimpleNamespace(status_code=code, message="raw-private-secret")))
+    planner, responses = planner_with([failure])
+    result = planner.plan(EXAMPLE)
+    assert result.status == "failure" and phrase in result.message
+    assert "raw-private-secret" not in result.model_dump_json()
+    assert len(responses.requests) == 1
+
+
 def test_trace_redacts_nested_secrets(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "arbitrary-secret")
     assert sanitize({"api_key": "x", "nested": ["sk-secret123", "arbitrary-secret"]}) == {
@@ -181,33 +206,214 @@ def test_trace_redacts_nested_secrets(monkeypatch):
 
 
 def test_strict_function_schemas():
-    definitions = tool_definitions()
-    assert len(definitions) == 4
-    assert all(d["type"] == "function" and d["strict"] for d in definitions)
-    assert all(d["parameters"]["additionalProperties"] is False for d in definitions)
+    definitions = declarations(TOOL_MODELS, DESCRIPTIONS)
+    assert len(definitions) == 5
+    assert definitions[-1]["function"]["name"] == "submit_plan"
+    assert all(d["function"]["parameters"]["additionalProperties"] is False for d in definitions)
 
 
-def test_real_sdk_responses_parse_with_mock_http_transport():
-    """Exercises actual SDK request serialization/parsing without an API key/network."""
+@pytest.mark.parametrize("backend,base_url,model", [("groq", "https://api.groq.com/openai/v1", "openai/gpt-oss-20b"),
+                                                   ("openai", "https://api.openai.com/v1", "gpt-4.1-mini")])
+def test_real_sdk_function_calling_with_mock_http_transport(backend, base_url, model):
+    """Actual OpenAI SDK against Groq's chat protocol, all four dynamic tools."""
     from openai import OpenAI
+    from providers.groq import GroqModel
+    from providers.openai import OpenAIModel
+    BASE_URL = base_url
     seen = []
+    draft = plan()
     def handler(request):
+        assert str(request.url) == BASE_URL + "/chat/completions"
         body = json.loads(request.content)
         seen.append(body)
-        output = [{"type": "function_call", "id": "fc_search", "call_id": "call_search", "name": "search_places",
-                   "arguments": json.dumps({"query": "park", "city": "Bengaluru", "area": None, "limit": 8}), "status": "completed"}] if len(seen) == 1 else (
-                  [{"type": "function_call", "id": "fc_cost", "call_id": "call_cost", "name": "estimate_cost",
-                    "arguments": json.dumps({"activities": [{"label": "Park", "cost": price()}], "transport_cost": price(confidence="verified")}), "status": "completed"}] if len(seen) == 2 else
-                  [{"type": "message", "id": "msg_final", "role": "assistant", "status": "completed", "content": [
-                      {"type": "output_text", "text": Decision(status="recommendation", message="Enjoy a short stroll", itinerary=Itinerary.model_validate(plan())).model_dump_json(), "annotations": []}]}])
-        return httpx.Response(200, json={"id": f"resp_{len(seen)}", "object": "response", "created_at": 0,
-            "status": "completed", "error": None, "incomplete_details": None, "instructions": None,
-            "model": "gpt-4.1-mini", "output": output, "parallel_tool_calls": False, "tool_choice": "auto",
-            "tools": body["tools"], "temperature": 1, "top_p": 1, "usage": None})
+        if len(seen) == 1:
+            calls = [("search_places", {"query": "park food", "city": "Bengaluru", "area": None, "limit": 8}, "search")]
+        elif len(seen) == 2:
+            calls = [("get_route", {"origin": {"place_id": "mock:cubbon", "latitude": None, "longitude": None},
+                    "destination": {"place_id": "mock:koshys", "latitude": None, "longitude": None}, "travel_mode": "walking"}, "route"),
+                ("estimate_cost", {"activities": [{"label": "Park", "cost": price()}], "transport_cost": price(confidence="verified")}, "cost"),
+                ("validate_plan", {"itinerary": draft, "preferences": Preferences.model_validate(EXAMPLE).model_dump(mode="json")}, "validate")]
+        else:
+            calls = [("submit_plan", Decision(status="recommendation", message="Enjoy a short stroll", itinerary=Itinerary.model_validate(draft)).model_dump(mode="json"), "final")]
+        return httpx.Response(200, json={"id": "chat-test", "object": "chat.completion", "created": 0,
+            "model": body["model"], "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None, "reasoning": "hidden reasoning", "tool_calls": [
+                {"type": "function", "id": identifier, "function": {"name": name, "arguments": json.dumps(args)}}
+                for name, args, identifier in calls]}}]})
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
-        client = OpenAI(api_key="test-not-real", http_client=http_client)
-        result = Planner(client=client, places_mode="mock").plan(EXAMPLE)
+        with OpenAI(api_key="test-not-real", base_url=BASE_URL, max_retries=0, http_client=http_client) as client:
+            provider = GroqModel if backend == "groq" else OpenAIModel
+            result = Planner(llm=provider(client=client), places_mode="mock").plan(EXAMPLE)
     assert result.status == "conditional", result.model_dump_json()
-    assert seen[0]["text"]["format"]["type"] == "json_schema"
-    assert seen[0]["text"]["format"]["strict"] is True
-    assert any(item.get("call_id") == "call_search" and item["type"] == "function_call_output" for item in seen[1]["input"])
+    assert len(seen) == 3 and seen[0]["model"] == model
+    assert seen[0]["tool_choice"] == "required"
+    assert len(seen[0]["tools"]) == 5 and "response_format" not in seen[0]
+    outputs = [m for m in seen[2]["messages"] if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in outputs] == ["search", "route", "cost", "validate"]
+    assert json.loads(outputs[0]["content"])["result"]["places"]
+    assert "hidden reasoning" not in json.dumps(seen) + result.model_dump_json()
+    assert {"search_places", "get_route", "estimate_cost", "validate_plan"} <= {e.name for e in result.trace}
+    assert next(e for e in result.trace if e.name == "get_route").success
+
+
+def test_agent_can_complete_after_six_turns():
+    planner, _ = planner_with([search_step()] * 5 + [budget_step(), final(plan())])
+    result = planner.plan(EXAMPLE)
+    assert result.status == "conditional" and result.iterations == 7
+    assert not result.validation.errors
+
+
+def test_default_iteration_limit_and_finish_feedback(monkeypatch):
+    monkeypatch.delenv("AGENT_MAX_ITERATIONS", raising=False)
+    planner, provider = planner_with([search_step()] * 12)
+    result = planner.plan(EXAMPLE)
+    assert result.status == "failure" and result.iterations == 12
+    assert "12-iteration" in result.message
+    assert any(e.name == "planning_budget" for e in result.trace)
+    assert any("Three model turns remain" in m.get("content", "") for m in provider.history)
+
+
+@pytest.mark.parametrize("value,expected", [("invalid", 12), ("1000", 20), ("0", 3), ("8", 8)])
+def test_iteration_limit_is_configurable_and_bounded(monkeypatch, value, expected):
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", value)
+    assert Planner().max_iterations == expected
+
+
+def test_revision_after_turn_six_is_validated():
+    planner, _ = planner_with([search_step()] * 4 + [budget_step(), final(plan([stop(end="15:00")])), final(plan())])
+    result = planner.plan(EXAMPLE)
+    assert result.status == "conditional" and result.iterations == 7 and result.revisions == 1
+    assert not result.validation.errors
+
+
+def test_planner_reserves_two_final_turns_for_submission(monkeypatch):
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "8")
+    planner, provider = planner_with([search_step()] * 5 + [budget_step(), final(plan())])
+    invoked = []
+    provider.finalize = lambda: invoked.append(planner.iterations)
+    result = planner.plan(EXAMPLE)
+    assert result.status == "conditional" and invoked == [7]
+    assert any(e.arguments.get("phase") == "final_submission" for e in result.trace)
+
+
+def test_invalid_tool_arguments_return_safe_field_hints():
+    planner, provider = planner_with([call("estimate_cost", {"api_key": "private-secret"}, "bad"), search_step(), budget_step(), final(plan())])
+    result = planner.plan(EXAMPLE)
+    output = json.loads(provider.history[0]["output"])
+    assert output["argument_errors"]
+    assert any(e["field"] == "activities" for e in output["argument_errors"])
+    assert "private-secret" not in json.dumps(output) + result.model_dump_json()
+    assert all("input" not in e for e in output["argument_errors"])
+
+
+def infeasible_step():
+    return lambda _: ModelTurn(decision=Decision(status="infeasible", message="No verified prices or quiet music venues", itinerary=None))
+
+
+def test_unsubstantiated_infeasibility_is_challenged_once():
+    planner, provider = planner_with([search_step(), infeasible_step(), infeasible_step()])
+    result = planner.plan(EXAMPLE)
+    assert result.status == "failure" and "does not establish" in result.message
+    assert sum(e.name == "infeasibility_review" for e in result.trace) == 1
+    assert any("Estimated costs are allowed" in m.get("content", "") for m in provider.history)
+    assert "No verified prices" not in result.message
+
+
+def test_afternoon_driving_plan_recovers_from_premature_infeasibility():
+    draft = plan([stop("mock:koshys", "15:10", "16:00", cost=price(350, 650), kind="food")])
+    draft["transport_cost"] = price(150, 300)
+    draft["trade_offs"] = ["Food is prioritized; headphones during seated rest can cover music. A separate walk is optional."]
+    planner, provider = planner_with([search_step(), budget_step(), infeasible_step(), final(draft)])
+    result = planner.plan({**EXAMPLE, "start_time": "15:00", "travel_mode": "driving"})
+    assert result.status == "conditional" and not result.validation.errors
+    assert result.validation.total_minutes == 60
+    assert result.validation.cost["total_estimated_cost"] == 950
+    assert result.preferences["travel_mode"] == "driving"
+    assert result.preferences["hard_constraints"] == ["vegetarian"]
+    assert any(e.name == "infeasibility_review" for e in result.trace)
+
+
+def test_unknown_data_and_soft_preferences_do_not_require_full_verification():
+    draft = plan([stop("mock:koshys", "15:10", "16:00", cost=price(None, None, "unknown"), kind="food")])
+    draft["transport_cost"] = price(150, 300)
+    planner, _ = planner_with([search_step(), budget_step(), final(draft)])
+    result = planner.plan({**EXAMPLE, "start_time": "15:00", "travel_mode": "driving"})
+    assert result.status == "conditional" and not result.validation.errors
+    assert result.validation.cost["total_estimated_cost"] is None
+    assert any("Crowds" in w for w in result.validation.warnings)
+
+
+def test_repeated_invalid_drafts_report_search_failure_not_impossibility():
+    bad = final(plan([stop(end="15:00")]))
+    planner, _ = planner_with([search_step(), budget_step(), bad, bad, bad])
+    result = planner.plan(EXAMPLE)
+    assert result.status == "failure" and result.validation.errors
+    assert "does not establish" in result.message
+    assert result.revisions == 2
+
+
+def test_missing_route_can_recover_one_discovered_food_stop():
+    draft = plan([stop("mock:koshys", "15:10", "16:00", price(350, 650), "food"),
+                  stop("mock:gallery", "16:20", "17:00", price(20, 100), "culture")])
+    draft["transport_cost"] = price(150, 300)
+    validation_call = call("validate_plan", {"itinerary": draft,
+        "preferences": Preferences.model_validate({**EXAMPLE, "start_time": "15:00", "travel_mode": "driving"}).model_dump(mode="json")}, "v")
+    planner, _ = planner_with([search_step(), validation_call, infeasible_step()])
+    result = planner.plan({**EXAMPLE, "start_time": "15:00", "travel_mode": "driving"})
+    assert result.status == "conditional" and not result.validation.errors
+    assert len(result.itinerary["stops"]) == 1
+    assert result.itinerary["stops"][0]["place_id"] == "mock:koshys"
+    assert result.validation.cost["total_estimated_cost"] == 950
+    assert any(e.name == "simplify_plan" for e in result.trace)
+    assert {"search_places", "estimate_cost", "validate_plan"} <= planner.executed_tools
+
+
+def test_simpler_recovery_corrects_first_buffer_without_extending_deadline():
+    draft = plan([stop("mock:koshys", "15:00", "15:50", price(350, 650), "food")])
+    draft["transport_cost"] = price(150, 300)
+    planner, _ = planner_with([search_step(), budget_step(), final(draft), infeasible_step()])
+    result = planner.plan({**EXAMPLE, "start_time": "15:00", "travel_mode": "driving"})
+    assert result.status == "conditional" and not result.validation.errors
+    assert result.itinerary["stops"][0]["start_time"] == "15:10"
+    assert result.itinerary["stops"][0]["end_time"] == "16:00"
+
+
+def test_simpler_recovery_cannot_bypass_dietary_false_evidence():
+    draft = plan([stop("mock:koshys", cost=price(350, 650), kind="food")])
+    planner, _ = planner_with([search_step(), budget_step(), final(draft), infeasible_step()])
+    # Inject a mock fixture with explicit contraindicating evidence.
+    from providers.mock import MockProvider
+    class UnsafeFood(MockProvider):
+        def search(self, *args, **kwargs):
+            places = super().search(*args, **kwargs)
+            return [p.model_copy(update={"evidence": {"vegetarian": False}}, deep=True) if p.place_id == "mock:koshys" else p for p in places]
+    planner.mock = UnsafeFood()
+    result = planner.plan(EXAMPLE)
+    assert result.status == "failure"
+    assert result.validation is None or result.validation.errors
+    assert not any(e.name == "validate_plan" and e.success for e in result.trace)
+
+
+def test_simpler_recovery_cannot_bypass_budget():
+    draft = plan([stop("mock:koshys", cost=price(2500, 3000), kind="food")])
+    planner, _ = planner_with([search_step(), budget_step(), final(draft), infeasible_step()])
+    result = planner.plan(EXAMPLE)
+    assert result.status == "failure"
+    assert not any(e.name == "validate_plan" and e.success for e in result.trace)
+
+
+def test_simpler_recovery_does_not_invent_neighborhood_route():
+    draft = plan([stop("mock:koshys", cost=price(350, 650), kind="food")])
+    planner, _ = planner_with([search_step(), budget_step(), final(draft), infeasible_step(), infeasible_step()])
+    result = planner.plan({**EXAMPLE, "starting_neighborhood": "central Bengaluru"})
+    assert result.status == "failure"
+    assert not any(e.name == "validate_plan" and e.success for e in result.trace)
+
+
+def test_simpler_recovery_respects_tool_execution_cap():
+    planner = Planner()
+    planner._reset()
+    planner.preferences = Preferences.model_validate(EXAMPLE)
+    planner.tool_calls = 23
+    assert planner._recover_simpler(Itinerary.model_validate(plan())) is None
+    assert planner.tool_calls == 23

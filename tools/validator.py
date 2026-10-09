@@ -1,5 +1,7 @@
 """Independent validation against provider evidence, never model assertions."""
-from agent.schemas import Itinerary, Place, Preferences, Route, Schema, ValidationResult, clock_minutes
+from math import ceil
+
+from agent.schemas import Itinerary, Place, Preferences, Route, Schema, ValidationResult, clock_minutes, clock_string
 from tools.budget import estimate_cost
 
 
@@ -70,8 +72,10 @@ def validate_plan(itinerary, preferences, *, catalog=None, routes=None) -> dict:
                 if route.status == "estimated":
                     critical_unknown = True
                     warnings.append(f"Unverified mock route: {previous_id} -> {stop.place_id}")
-        if begin < previous_end + route_minutes + stop.buffer_minutes:
-            errors.append(f"Not enough time for travel and buffer before {stop.place_id}")
+        earliest = ceil(previous_end + route_minutes + stop.buffer_minutes)
+        if begin < earliest:
+            earliest_text = clock_string(earliest) if earliest < 1440 else "after midnight"
+            errors.append(f"Not enough time for travel and buffer before {stop.place_id}; earliest activity start is {earliest_text}. Shift the activity within the available window or shorten the plan.")
         if end > deadline:
             errors.append(f"Available time exceeded at {stop.place_id}")
         place = catalog.get(stop.place_id)

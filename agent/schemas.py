@@ -207,6 +207,15 @@ class TraceEvent(Schema):
     iteration: int
 
 
+class PlanOption(Schema):
+    id: str
+    label: str
+    message: str
+    status: Literal["success", "conditional"]
+    itinerary: dict
+    validation: ValidationResult
+
+
 class PlannerResult(Schema):
     status: Literal["success", "conditional", "infeasible", "failure"]
     mode: Literal["agent", "offline_demo"]
@@ -217,3 +226,4 @@ class PlannerResult(Schema):
     trace: list[TraceEvent] = Field(default_factory=list)
     iterations: int = 0
     revisions: int = 0
+    alternatives: list[PlanOption] = Field(default_factory=list)

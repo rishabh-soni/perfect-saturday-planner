@@ -1,7 +1,6 @@
-"""Bounded Responses API agent plus an explicit deterministic offline demo."""
+"""Bounded provider-neutral agent plus an explicit deterministic offline demo."""
 from __future__ import annotations
 
-import json
 import math
 import os
 import re
@@ -10,14 +9,15 @@ from time import perf_counter
 from pydantic import ValidationError
 
 from agent.prompts import SYSTEM_PROMPT
-from agent.schemas import (Decision, Itinerary, Place, PlannerResult, Preferences,
+from agent.schemas import (Decision, Itinerary, Place, PlanOption, PlannerResult, Preferences,
                            Price, Route, Stop, TraceEvent, ValidationResult, clock_minutes, clock_string)
 from providers.google import GoogleProvider
+from providers.llm import ModelError, ToolResult
 from providers.mock import MockProvider
 from tools.budget import BudgetArguments, estimate_cost
 from tools.places import SearchArguments, search_places
 from tools.routing import RouteArguments, get_route
-from tools.validator import ValidationArguments, validate_plan
+from tools.validator import ValidationArguments, opening_check, validate_plan
 
 
 TOOL_MODELS = {"search_places": SearchArguments, "get_route": RouteArguments,
@@ -30,16 +30,6 @@ DESCRIPTIONS = {
 }
 
 
-def tool_definitions():
-    # Public SDK helper also generates strict nested Pydantic schemas correctly.
-    from openai import pydantic_function_tool
-    definitions = []
-    for name, model in TOOL_MODELS.items():
-        function = pydantic_function_tool(model, name=name, description=DESCRIPTIONS[name])["function"]
-        definitions.append({"type": "function", **function})
-    return definitions
-
-
 def sanitize(value):
     if isinstance(value, dict):
         return {str(k): "[REDACTED]" if re.search(r"key|secret|token|authorization|password", str(k), re.I)
@@ -47,9 +37,9 @@ def sanitize(value):
     if isinstance(value, list):
         return [sanitize(v) for v in value[:30]]
     if isinstance(value, str):
-        value = re.sub(r"sk-[A-Za-z0-9_-]+", "[REDACTED]", value)
+        value = re.sub(r"(?:sk-|gsk_)[A-Za-z0-9_-]+", "[REDACTED]", value)
         value = re.sub(r"AIza[A-Za-z0-9_-]+", "[REDACTED]", value)
-        for key in (os.getenv("OPENAI_API_KEY"), os.getenv("GOOGLE_MAPS_API_KEY")):
+        for key in (os.getenv("GROQ_API_KEY"), os.getenv("GEMINI_API_KEY"), os.getenv("OPENAI_API_KEY"), os.getenv("GOOGLE_MAPS_API_KEY")):
             if key:
                 value = value.replace(key, "[REDACTED]")
         return value[:3000]
@@ -57,16 +47,23 @@ def sanitize(value):
 
 
 class Planner:
-    MAX_ITERATIONS = 6
+    MAX_ITERATIONS = 12
     MAX_REVISIONS = 2
     MAX_TOOL_CALLS = 24
 
-    def __init__(self, *, client=None, google=None, mock=None, model=None, places_mode="auto"):
+    def __init__(self, *, client=None, llm=None, google=None, mock=None, model=None, places_mode="auto", on_event=None):
+        try:
+            configured_limit = int(os.getenv("AGENT_MAX_ITERATIONS", str(self.MAX_ITERATIONS)))
+        except ValueError:
+            configured_limit = self.MAX_ITERATIONS
+        self.max_iterations = min(20, max(3, configured_limit))
         self.client = client
+        self.llm = llm
         self.google = google
         self.mock = mock or MockProvider()
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         self.places_mode = places_mode
+        self.on_event = on_event
 
     def _reset(self):
         self.catalog = {}
@@ -74,12 +71,17 @@ class Planner:
         self.trace = []
         self.iterations = self.revisions = self.tool_calls = 0
         self.empty_retry_used = False
+        self.infeasible_retry_used = False
+        self.last_candidate = None
         self.executed_tools = set()
 
     def _record(self, name, args, started, success, summary):
-        self.trace.append(TraceEvent(name=name, arguments=sanitize(args),
-                                     duration_ms=round((perf_counter()-started)*1000, 3),
-                                     success=success, summary=sanitize(summary), iteration=self.iterations))
+        event = TraceEvent(name=name, arguments=sanitize(args),
+                           duration_ms=round((perf_counter()-started)*1000, 3),
+                           success=success, summary=sanitize(summary), iteration=self.iterations)
+        self.trace.append(event)
+        if self.on_event:
+            self.on_event(event.model_copy(deep=True))
 
     def _execute(self, name, args):
         started = perf_counter()
@@ -112,6 +114,7 @@ class Planner:
                 success = not result["unknown_cost_items"]
                 summary = f"INR upper estimate {result['total_estimated_cost']}; {len(result['unknown_cost_items'])} unknown costs"
             else:
+                self.last_candidate = parsed.itinerary.model_copy(deep=True)
                 args["preferences"] = self.preferences.model_dump(mode="json")
                 result = validate_plan(**args, catalog=self.catalog, routes=self.routes)
                 success = result["passed"]
@@ -120,6 +123,12 @@ class Planner:
         except (ValueError, TypeError, KeyError) as exc:
             # Do not echo validation exception input (may contain user-supplied secrets).
             result = {"error": "Invalid tool arguments or unsupported evidence", "type": type(exc).__name__}
+            if name == "get_route":
+                result["guidance"] = "Use origin/destination place_id copied exactly from search_places results, with latitude=null and longitude=null. Do not route from an unspecified home."
+            if isinstance(exc, ValidationError):
+                result["argument_errors"] = sanitize([
+                    {"field": ".".join(map(str, e["loc"])), "type": e["type"], "message": e["msg"]}
+                    for e in exc.errors(include_input=False, include_context=False, include_url=False)])
             success, summary = False, result["error"]
         self._record(name, args, started, success, summary)
         return result
@@ -142,6 +151,57 @@ class Planner:
     def _validation(self, plan):
         return ValidationResult.model_validate(self._execute("validate_plan", {
             "itinerary": plan.model_dump(mode="json"), "preferences": self.preferences.model_dump(mode="json")}))
+
+    def _recover_simpler(self, candidate):
+        """Bounded recovery of an LLM draft; all evidence/constraints remain authoritative."""
+        if candidate is None or self.revisions >= self.MAX_REVISIONS or self.tool_calls > self.MAX_TOOL_CALLS - 2:
+            return None
+        # Prefer a discovered food stop; never synthesize a venue, route or price.
+        options = sorted(candidate.stops, key=lambda stop: stop.kind != "food")
+        for stop in options:
+            if stop.place_id not in self.catalog:
+                continue
+            duration = clock_minutes(stop.end_time) - clock_minutes(stop.start_time)
+            if duration <= 0:
+                continue
+            origin = candidate.starting_place_id if self.preferences.starting_neighborhood else None
+            travel = 0
+            if origin and origin != stop.place_id:
+                route = self.routes.get((origin, stop.place_id, self.preferences.travel_mode))
+                if route is None or route.status == "unavailable" or route.duration_minutes is None:
+                    continue
+                travel = route.duration_minutes
+            begin = max(clock_minutes(stop.start_time), math.ceil(clock_minutes(self.preferences.start_time) + travel + stop.buffer_minutes))
+            end = begin + duration
+            if end >= 1440 or end > clock_minutes(self.preferences.start_time) + self.preferences.duration_minutes:
+                continue
+            shortened = candidate.model_copy(deep=True)
+            selected = stop.model_copy(update={"start_time": clock_string(begin), "end_time": clock_string(end)}, deep=True)
+            shortened.stops = [selected]
+            shortened.starting_place_id = origin
+            shortened.title = f"A simpler Saturday in {self.preferences.city}"
+            shortened.trade_offs = [
+                "This shorter plan prioritizes one activity; separate stops for every interest are omitted to reduce travel and uncertainty."]
+            if "music" in self.preferences.interests:
+                shortened.trade_offs.append("Music can be an optional seated headphone break; no live event or venue music is verified.")
+            if any(interest in self.preferences.interests for interest in ("walks", "walk")) and selected.kind != "walk":
+                shortened.trade_offs.append("A separate walk is omitted from this shorter itinerary.")
+            shortened.warnings = [
+                "A shorter fallback from discovered venue evidence; crowd levels and venue music remain unverified."]
+            self.revisions += 1
+            self._record("simplify_plan", {"place_id": selected.place_id, "attempt": self.revisions,
+                "start_time": selected.start_time, "end_time": selected.end_time}, perf_counter(), True,
+                "Reduced model draft to one discovered stop; retained hard constraints and original time window")
+            self._execute("estimate_cost", {"activities": [{"label": selected.activity, "cost": selected.cost.model_dump()}],
+                "transport_cost": shortened.transport_cost.model_dump()})
+            validation = self._validation(shortened)
+            if not validation.errors and len(self.executed_tools) >= 3:
+                return self._result("success" if validation.passed else "conditional",
+                    "A shorter plan is available using a discovered venue. Separate activities for all interests are omitted; review the estimates and confirmation warnings.",
+                    "agent", shortened, validation)
+            # One recovery validation per attempt; never relax a failed hard check.
+            return None
+        return None
 
     def _result(self, status, message, mode, plan=None, validation=None):
         hydrated = None
@@ -167,6 +227,111 @@ class Planner:
                              itinerary=hydrated, validation=validation, trace=self.trace,
                              iterations=self.iterations, revisions=self.revisions)
 
+    def add_alternatives(self, result, *, limit=3):
+        """Compare bounded, evidence-backed variants after the genuine agent run.
+
+        This is a traced business-rule fallback, not an additional LLM response.
+        Every offered option retains the original hard constraints and is validated.
+        """
+        if not self.catalog or not hasattr(self, "preferences"):
+            return result
+        if result.mode == "agent" and len(self.executed_tools) < 3:
+            return result
+        base = self.last_candidate
+        if result.itinerary:
+            raw = {k: result.itinerary[k] for k in Itinerary.model_fields}
+            raw["stops"] = [{k: stop[k] for k in Stop.model_fields} for stop in raw["stops"]]
+            base = Itinerary.model_validate(raw)
+        if base is None:
+            return result
+        options = []
+        signatures = set()
+        if result.status in {"success", "conditional"} and result.validation and not result.validation.errors:
+            options.append(PlanOption(id="option-1", label="Recommended day", message=result.message,
+                                      status=result.status, itinerary=result.itinerary, validation=result.validation))
+            signatures.add(tuple(s.place_id for s in base.stops))
+        self._record("compare_options", {"requested_options": limit}, perf_counter(), True,
+                     "Comparing shorter alternatives from discovered places; retaining original constraints")
+        # Prefer the model's own stops and prices before other discovered venues.
+        candidates = list(base.stops)
+        seen = {s.place_id for s in candidates}
+        interests = set(self.preferences.interests)
+        for place in self.catalog.values():
+            if place.place_id in seen:
+                continue
+            types = set(place.types)
+            if types & {"restaurant", "cafe", "food"} and "food" in interests:
+                kind, activity, minutes = "food", "An unhurried food break", 45
+            elif types & {"park", "walks", "nature"} and interests & {"walk", "walks", "nature"}:
+                kind, activity, minutes = "walk", "A gentle walk with time to sit", 35
+            elif types & {"museum", "art", "culture", "book_store", "books"} and interests & {"art", "culture", "books"}:
+                kind, activity, minutes = "culture", "Browse at your own pace", 40
+            else:
+                continue
+            candidates.append(Stop(place_id=place.place_id, kind=kind, activity=activity,
+                start_time="00:00", end_time=clock_string(minutes), buffer_minutes=10,
+                cost=place.estimated_price or Price(minimum=None, maximum=None, confidence="unknown",
+                    basis="No current menu or admission price was supplied by the place provider"),
+                rationale="Prioritizes one of your interests with fewer stops and less travel."))
+        for stop in candidates:
+            if len(options) >= min(3, max(1, limit)) or self.tool_calls > self.MAX_TOOL_CALLS - 3:
+                break
+            if (stop.place_id,) in signatures or stop.place_id not in self.catalog:
+                continue
+            origin = base.starting_place_id if self.preferences.starting_neighborhood else None
+            if self.preferences.starting_neighborhood and not origin:
+                continue
+            travel = 0
+            if origin and origin != stop.place_id:
+                edge = (origin, stop.place_id, self.preferences.travel_mode)
+                if edge not in self.routes:
+                    self._execute("get_route", {"origin": {"place_id": origin, "latitude": None, "longitude": None},
+                        "destination": {"place_id": stop.place_id, "latitude": None, "longitude": None},
+                        "travel_mode": self.preferences.travel_mode})
+                route = self.routes.get(edge)
+                if route is None or route.status == "unavailable" or route.duration_minutes is None:
+                    continue
+                travel = route.duration_minutes
+            length = min(60, clock_minutes(stop.end_time) - clock_minutes(stop.start_time))
+            if length <= 0:
+                continue
+            earliest = math.ceil(clock_minutes(self.preferences.start_time) + travel + stop.buffer_minutes)
+            deadline = clock_minutes(self.preferences.start_time) + self.preferences.duration_minutes
+            # A later opening can fit the same window; do not declare it impossible at the first slot.
+            begin = next((t for t in range(earliest, deadline - length + 1, 15)
+                          if opening_check(self.catalog[stop.place_id], t, t + length) is not False), None)
+            if begin is None or begin + length >= 1440:
+                continue
+            selected = stop.model_copy(update={"start_time": clock_string(begin), "end_time": clock_string(begin + length)}, deep=True)
+            place = self.catalog[stop.place_id]
+            omitted = sorted(interests - ({"food"} if stop.kind == "food" else {"walk", "walks", "nature"} if stop.kind == "walk" else {"art", "culture", "books"}))
+            explanation = f"Focus on {place.name} for {length} minutes, with fewer stops and more spare time."
+            trade_offs = ["This alternative reduces travel by keeping one venue."]
+            if omitted:
+                trade_offs.append("Separate activities for " + ", ".join(omitted) + " are omitted; they remain optional preferences.")
+            candidate = Itinerary(title=f"A slower Saturday: {place.name}", stops=[selected],
+                starting_place_id=origin, transport_cost=base.transport_cost,
+                warnings=["Venue hours, prices and crowd levels require the confirmations listed below."], trade_offs=trade_offs)
+            self._execute("estimate_cost", {"activities": [{"label": selected.activity, "cost": selected.cost.model_dump()}],
+                                           "transport_cost": candidate.transport_cost.model_dump()})
+            validation = self._validation(candidate)
+            if validation.errors:
+                continue
+            status = "success" if validation.passed else "conditional"
+            hydrated = self._result(status, explanation, result.mode, candidate, validation)
+            options.append(PlanOption(id=f"option-{len(options)+1}", label=f"{place.name} · shorter break",
+                message=explanation, status=status, itinerary=hydrated.itinerary, validation=validation))
+            signatures.add((stop.place_id,))
+        if options and result.status not in {"success", "conditional"}:
+            first = options[0]
+            result = self._result(first.status, "The full request did not fit the checked evidence. " + first.message,
+                                  result.mode)
+            result.itinerary, result.validation = first.itinerary, first.validation
+            result.status = first.status
+        result.alternatives = options
+        result.trace = list(self.trace)
+        return result
+
     def plan(self, input_data, *, offline=False):
         self._reset()
         if hasattr(self, "preferences"):
@@ -182,77 +347,112 @@ class Planner:
                      f"Normalized {self.preferences.city}; {self.preferences.duration_minutes} minutes; INR {self.preferences.budget}")
         if offline:
             return self._offline()
-        if self.client is None:
-            if not os.getenv("OPENAI_API_KEY"):
+        owned = self.llm is None
+        if owned:
+            if self.client is None and not os.getenv("OPENAI_API_KEY", "").strip():
                 return self._result("failure", "OPENAI_API_KEY is missing. Use --mock for the labeled offline demo, or configure a key for the LLM agent.", "agent")
-            from openai import OpenAI
-            self.client = OpenAI(timeout=30, max_retries=0)
-        if self.google is None and self.places_mode != "mock" and os.getenv("GOOGLE_MAPS_API_KEY"):
-            self.google = GoogleProvider(os.environ["GOOGLE_MAPS_API_KEY"])
-        return self._agent()
+            from providers.openai import OpenAIModel
+            try:
+                self.llm = OpenAIModel(api_key=os.getenv("OPENAI_API_KEY"), model=self.model, client=self.client)
+            except Exception:
+                return self._result("failure", "Could not initialize OpenAI. Check server configuration or use the demo.", "agent")
+        try:
+            if self.google is None and self.places_mode != "mock" and os.getenv("GOOGLE_MAPS_API_KEY"):
+                self.google = GoogleProvider(os.environ["GOOGLE_MAPS_API_KEY"])
+            return self._agent()
+        finally:
+            if owned:
+                self.llm.close()
+                self.llm = None
 
     def _agent(self):
-        history = [{"role": "system", "content": SYSTEM_PROMPT},
-                   {"role": "user", "content": json.dumps(self.preferences.context())}]
         last_plan = last_validation = None
-        for iteration in range(1, self.MAX_ITERATIONS + 1):
+        try:
+            session = self.llm.start(SYSTEM_PROMPT + f"\nYou have {self.max_iterations} model turns total. Reserve turns for validation, correction and submit_plan.", self.preferences.context(), TOOL_MODELS, DESCRIPTIONS)
+        except Exception:
+            return self._result("failure", "Could not initialize model session. Check configuration or use the demo.", "agent")
+        for iteration in range(1, self.max_iterations + 1):
             self.iterations = iteration
             started = perf_counter()
             try:
-                response = self.client.responses.parse(model=self.model, input=history, tools=tool_definitions(),
-                                                       text_format=Decision, parallel_tool_calls=False,
-                                                       max_output_tokens=4500, store=False)
-            except Exception as exc:
-                self._record("model_response", {}, started, False,
-                             f"OpenAI call failed ({type(exc).__name__}); raw error omitted")
-                return self._result("failure", "Model unavailable or returned unusable output. Check configuration and retry; --mock runs offline.",
-                                    "agent", last_plan, last_validation)
-            # Keep ALL output items, including opaque reasoning items required by Responses.
-            # They are sent back to the API only and are never included in our public trace.
-            history.extend(response.output)
-            calls = [item for item in response.output if item.type == "function_call"]
-            self._record("model_response", {}, started, True, f"Model requested {len(calls)} tool actions" if calls else "Model returned final decision")
-            if calls:
-                for call in calls:
-                    try:
-                        args = json.loads(call.arguments)
-                    except (ValueError, TypeError):
-                        args = {}
-                    result = self._execute(call.name, args)
-                    if call.name == "search_places":
-                        result = self._retry_empty(result, args.get("area") if isinstance(args, dict) else None)
-                    history.append({"type": "function_call_output", "call_id": call.call_id,
-                                    "output": json.dumps(result, allow_nan=False)})
-                if self.tool_calls >= self.MAX_TOOL_CALLS:
-                    break
-                continue
-            decision = response.output_parsed
-            if decision is None:
-                return self._result("failure", "Model refused or did not provide a structured decision. Try a simpler request.", "agent")
-            if decision.status == "infeasible":
-                if decision.itinerary is not None:
-                    return self._result("failure", "Model returned an inconsistent infeasibility response.", "agent")
-                return self._result("infeasible", decision.message, "agent")
-            if decision.itinerary is None:
-                history.append({"role": "user", "content": "A recommendation must contain an itinerary; supply it or return infeasible."})
-                continue
-            last_plan = decision.itinerary
-            last_validation = self._validation(last_plan)
-            if not last_validation.errors:
-                if len(self.executed_tools) < 3:
-                    history.append({"role": "user", "content": "Before finalizing, execute at least three distinct tools, including estimate_cost. Venue and route evidence must be obtained through tools."})
+                if iteration == self.max_iterations - 2:
+                    message = "Three model turns remain, including this one. Reuse discovered nearby venues and recorded routes; avoid new discovery unless essential. Shorten an infeasible plan, validate necessary changes, then call submit_plan alone. Prefer a shorter conditional plan over abandoning soft interests."
+                    session.feedback(message)
+                    self._record("planning_budget", {"remaining_turns": 3}, perf_counter(), True,
+                                 "Asked model to finish within remaining turn budget")
+                if iteration == self.max_iterations - 1 and callable(getattr(session, "finalize", None)):
+                    session.finalize()
+                    self._record("planning_budget", {"remaining_turns": 2, "phase": "final_submission"}, perf_counter(), True,
+                                 "Reserved final two turns for structured submission and correction")
+                turn = session.next_turn()
+                if turn.correction:
+                    self._record("model_response", turn.diagnostics, started, False, "Invalid structured submission; requested correction")
+                    session.feedback(turn.correction)
                     continue
-                return self._result("success" if last_validation.passed else "conditional", decision.message,
-                                    "agent", last_plan, last_validation)
-            if self.revisions >= self.MAX_REVISIONS:
-                return self._result("infeasible", "Could not satisfy hard feasibility checks after two revisions; the attached draft is invalid and must not be followed.",
-                                    "agent", last_plan, last_validation)
-            self.revisions += 1
-            started = perf_counter()
-            self._record("validation_revision", {"attempt": self.revisions, "errors": last_validation.errors},
-                         started, True, "Requested itinerary revision after independent validation failure")
-            history.append({"role": "user", "content": "Independent server validation failed. Revise or return infeasible: " + last_validation.model_dump_json()})
-        return self._result("failure", "Agent reached its six-iteration or tool-call limit. Any attached draft is unapproved; try a simpler request.",
+                self._record("model_response", turn.diagnostics, started, True,
+                             f"Model requested {len(turn.calls)} tool actions" if turn.calls else "Model returned final decision")
+                if turn.calls:
+                    outputs = []
+                    for call in turn.calls:
+                        result = self._execute(call.name, call.arguments)
+                        if call.name == "search_places":
+                            result = self._retry_empty(result, call.arguments.get("area"))
+                        outputs.append(ToolResult(request=call, output=result))
+                    session.respond(outputs)
+                    if self.tool_calls >= self.MAX_TOOL_CALLS:
+                        break
+                    continue
+                decision = turn.decision
+                if decision is None:
+                    return self._result("failure", "Model did not provide a structured decision. Try a simpler request.", "agent")
+                if decision.status == "infeasible":
+                    if decision.itinerary is not None:
+                        return self._result("failure", "Model returned an inconsistent infeasibility response.", "agent")
+                    recovered = self._recover_simpler(last_plan or self.last_candidate)
+                    if recovered is not None:
+                        return recovered
+                    if not self.infeasible_retry_used and iteration < self.max_iterations and self.tool_calls < self.MAX_TOOL_CALLS:
+                        self.infeasible_retry_used = True
+                        self._record("infeasibility_review", {"discovered_venues": len(self.catalog)}, perf_counter(), True,
+                                     "Challenged unsupported infeasibility; requested a shorter best-effort plan")
+                        session.feedback("Your infeasibility claim has not been established. Attempt a simpler one- or two-stop recommendation using discovered nearby venues before giving up. Interests and avoiding crowds are soft preferences, not mandatory separate activities. Estimated costs are allowed; unknown hours/prices/dietary evidence require warnings, not automatic rejection. Keep the original hard constraints, budget and travel mode. The supplied start time begins the available window: add the first buffer, e.g. 15:00 arrival plus 10 minutes means 15:10 activity, which is allowed. Include a nonzero estimated driving allowance. Reuse recorded routes or omit unnecessary transitions; no supplied neighborhood means starting_place_id=null. Explain omitted interests and any confirmation warnings. If evidence really prevents even this smaller plan, return infeasible with the specific candidate-level blockers; do not claim the entire city or request is impossible.")
+                        continue
+                    return self._result("failure", "The agent could not find a validated plan within its current search and planning limits. This does not establish that your preferences are impossible. Retry with a starting neighborhood to focus discovery.",
+                                        "agent", last_plan, last_validation)
+                if decision.itinerary is None:
+                    session.feedback("A recommendation must contain an itinerary; supply it or return infeasible.")
+                    continue
+                last_plan = decision.itinerary
+                last_validation = self._validation(last_plan)
+                if not last_validation.errors:
+                    if len(self.executed_tools) < 3:
+                        session.feedback("Before finalizing, execute at least three distinct tools, including estimate_cost. Venue and route evidence must be obtained through tools.")
+                        continue
+                    return self._result("success" if last_validation.passed else "conditional", decision.message,
+                                        "agent", last_plan, last_validation)
+                if iteration >= self.max_iterations - 1 or self.revisions == self.MAX_REVISIONS - 1:
+                    recovered = self._recover_simpler(last_plan)
+                    if recovered is not None:
+                        return recovered
+                if self.revisions >= self.MAX_REVISIONS:
+                    return self._result("failure", "The agent could not validate its proposed plan after two revisions. This does not establish that your request is impossible; any attached draft is unapproved.",
+                                        "agent", last_plan, last_validation)
+                self.revisions += 1
+                self._record("validation_revision", {"attempt": self.revisions, "errors": last_validation.errors},
+                             perf_counter(), True, "Requested itinerary revision after independent validation failure")
+                session.feedback("Independent server validation failed. Revise or return infeasible: " + last_validation.model_dump_json())
+            except Exception as exc:
+                diagnostics = getattr(exc, "diagnostics", {})
+                detail = f"HTTP {diagnostics['http_status']} {diagnostics.get('api_status') or ''}" if diagnostics.get("http_status") else type(exc).__name__
+                self._record("model_response", diagnostics, started, False,
+                             f"Model call failed ({detail}); inspect sanitized diagnostics for details")
+                message = str(exc) if isinstance(exc, ModelError) else "Model unavailable or returned unusable output. Check configuration and retry; the Bengaluru demo remains available."
+                return self._result("failure", sanitize(message), "agent", last_plan, last_validation)
+        recovered = self._recover_simpler(last_plan or self.last_candidate)
+        if recovered is not None:
+            return recovered
+        limit = f"{self.MAX_TOOL_CALLS}-tool-call" if self.tool_calls >= self.MAX_TOOL_CALLS else f"{self.max_iterations}-iteration"
+        return self._result("failure", f"Agent reached its {limit} limit after {self.iterations} model turns and {self.tool_calls} tool calls. Any attached draft is unapproved; try fewer stops or a smaller area.",
                             "agent", last_plan, last_validation)
 
     def _offline(self):
